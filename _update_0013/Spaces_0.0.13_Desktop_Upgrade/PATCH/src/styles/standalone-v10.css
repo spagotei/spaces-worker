@@ -1,0 +1,85 @@
+/* Spaces 0.0.10 — desktop updater chrome + tablet constraints */
+
+/* ---------- native-feeling frameless desktop chrome ---------- */
+.desktop-titlebar{
+  position:fixed;
+  z-index:1000;
+  inset:0 0 auto 0;
+  height:34px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  user-select:none;
+  border-bottom:1px solid rgba(255,255,255,.055);
+  background:rgba(8,8,11,.985);
+  color:#8a858e;
+  -webkit-backdrop-filter:blur(20px);
+  backdrop-filter:blur(20px);
+}
+.desktop-titlebar-brand{height:100%;min-width:0;display:flex;align-items:center;gap:7px;padding-left:10px;pointer-events:auto}
+.desktop-titlebar-brand .titlebar-mark{width:20px;height:20px;display:grid;place-items:center;border:1px solid color-mix(in srgb,var(--app-accent,#8b6ca8) 25%,rgba(255,255,255,.07));border-radius:7px;background:color-mix(in srgb,var(--app-accent,#8b6ca8) 8%,#0c0c11);color:color-mix(in srgb,var(--app-accent,#8b6ca8) 72%,#fff);font-size:8px;font-weight:800;line-height:1}
+.desktop-titlebar-brand strong{font-size:8px;font-weight:680;color:#aaa4ae;letter-spacing:.01em}
+.desktop-titlebar-brand small{margin-left:2px;font-size:6px;color:#4e4a52}
+.desktop-window-controls{height:100%;display:flex;align-items:stretch;margin-left:auto}
+.window-control,.titlebar-update{position:relative;width:46px;height:34px;display:grid;place-items:center;border:0;border-radius:0;background:transparent;color:#817b86;cursor:pointer;transition:background .14s ease,color .14s ease}
+.window-control:hover{background:rgba(255,255,255,.055);color:#ded9e1}.window-close:hover{background:#bd4452;color:#fff}
+.window-minimize{width:10px;height:1px;background:currentColor}.window-maximize{width:10px;height:9px;border:1px solid currentColor}
+.titlebar-update{--update-accent:#9a74b8;width:42px;color:#b493cc}
+.titlebar-update:hover{background:rgba(154,116,184,.11);color:#eadff2}
+.titlebar-update>i{position:absolute;right:8px;top:7px;width:5px;height:5px;border-radius:50%;background:var(--update-accent);box-shadow:0 0 0 3px rgba(154,116,184,.14);animation:updateBeacon 1.8s ease-in-out infinite}
+.titlebar-update.working svg{animation:updateArrowBounce .85s ease-in-out infinite}
+@keyframes updateBeacon{50%{opacity:.45;box-shadow:0 0 0 5px transparent}}
+@keyframes updateArrowBounce{50%{transform:translateY(2px)}}
+
+.tauri-desktop-content{position:fixed;inset:34px 0 0 0;overflow:hidden;background:#08080b}
+.tauri-desktop-content>.spaces-app-shell,.tauri-desktop-content .spaces-app-shell,.tauri-desktop-content>.boot-screen,.tauri-desktop-content .boot-screen,.tauri-desktop-content>.login-stage,.tauri-desktop-content .login-stage{height:100%!important;min-height:0!important}
+
+.desktop-update-card{position:fixed;z-index:1002;right:10px;top:42px;width:min(354px,calc(100vw - 20px));overflow:hidden;border:1px solid rgba(255,255,255,.085);border-radius:15px;background:rgba(14,14,19,.985);box-shadow:0 24px 75px rgba(0,0,0,.62),inset 0 1px rgba(255,255,255,.03);backdrop-filter:blur(26px);color:#b7b0bb}
+.desktop-update-card>header{min-height:58px;display:grid;grid-template-columns:38px minmax(0,1fr) 30px;align-items:center;gap:8px;padding:8px 8px 8px 10px;border-bottom:1px solid rgba(255,255,255,.05)}
+.desktop-update-card>header>span:nth-child(2){min-width:0;display:grid;gap:2px}.desktop-update-card>header small{font-size:6px;color:#9d7fb4;letter-spacing:.09em}.desktop-update-card>header strong{font-size:9px;color:#e1dbe5}.desktop-update-card>header>button{width:28px;height:28px;display:grid;place-items:center;border-radius:8px;background:transparent;color:#706a75}.desktop-update-card>header>button:hover{background:rgba(255,255,255,.045);color:#d7d1db}
+.update-card-icon{width:36px;height:36px;display:grid;place-items:center;border-radius:10px;background:rgba(154,116,184,.10);color:#bea1d2}
+.desktop-update-card>p{margin:0;padding:12px 13px 5px;font-size:8px;line-height:1.55;color:#8d8792;white-space:pre-line;max-height:116px;overflow:auto}
+.desktop-update-card>footer{display:flex;justify-content:flex-end;gap:7px;padding:10px 12px 12px}.desktop-update-card>footer button{min-height:34px}.desktop-update-card>footer .primary-button{display:inline-flex;align-items:center;gap:7px}
+.update-progress-wrap{display:grid;gap:6px;padding:9px 13px 2px}.update-progress{height:4px;overflow:hidden;border-radius:999px;background:rgba(255,255,255,.055)}.update-progress>i{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,#6f4b87,#b998d0);transition:width .18s ease}.update-progress-wrap small{font-size:6.5px;color:#716b77}.update-error{margin:8px 12px 0;padding:8px 9px;border:1px solid rgba(205,82,95,.18);border-radius:9px;background:rgba(205,82,95,.06);color:#c78c94;font-size:7px;line-height:1.45}
+
+/* ---------- tablet is its own layout, not a scaled phone/desktop ---------- */
+@media (min-width:721px) and (max-width:1180px){
+  :root{--server-rail:62px;--channel-rail:220px;--member-rail:210px}
+  .server-rail{padding:9px 6px!important;gap:7px!important}.server-home,.server-button{width:46px!important;height:46px!important}.server-button .avatar{--avatar-size:40px!important}.server-rail-label{font-size:6px!important}
+  .channel-sidebar{width:var(--channel-rail)}.space-header{padding:0 10px!important}.sidebar-scroll{padding-left:6px!important;padding-right:6px!important}.sidebar-item{min-height:38px!important}
+  .topbar{padding:0 9px 0 10px!important}.topbar-left{min-width:0}.topbar-left>div{min-width:0}.topbar-left>div>span{max-width:28vw!important;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.topbar-actions{gap:5px}.search-pill{min-width:0!important;width:40px!important;padding:0!important;justify-content:center!important}.search-pill span,.search-pill kbd{display:none!important}
+  .view-scroll{padding:18px 16px 34px!important}.hero-panel{grid-template-columns:minmax(0,1fr)!important;padding:24px!important}.hero-copy{max-width:650px!important}.hero-orbit{display:none!important}.space-card-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.space-card{min-width:0!important}.dashboard-strip{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .members-layout{grid-template-columns:minmax(0,1fr)!important}.member-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.member-detail{position:relative!important;margin-top:10px!important}
+  .roles-view{grid-template-columns:210px minmax(0,1fr)!important}.role-editor-panel{padding:15px!important}.permission-matrix{grid-template-columns:repeat(2,minmax(0,1fr))!important}.notes-view{grid-template-columns:210px minmax(0,1fr)!important}.note-editor-panel{min-width:0!important}.comments-panel{width:min(300px,34vw)!important}
+  .settings-view .settings-grid,.personal-settings .settings-grid{grid-template-columns:1fr!important}.settings-view .background-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .notification-center{right:10px!important;width:min(390px,calc(100vw - 84px))!important}.incoming-notice{right:10px!important;width:min(360px,calc(100vw - 84px))!important}
+  .spaces-emoji-picker{right:10px!important;width:min(410px,calc(100vw - 84px))!important;max-height:min(560px,72vh)!important}.sep-native-grid{grid-template-columns:repeat(7,minmax(0,1fr))!important}.sep-brand-grid{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+  .modal-shell{width:min(620px,calc(100vw - 48px))!important}.account-quick-menu{max-width:min(390px,calc(100vw - 80px))!important}
+}
+
+/* Narrow tablets use the drawer but keep tablet-sized controls. */
+@media (min-width:721px) and (max-width:860px){
+  .spaces-app-shell,.spaces-app-shell.with-member-rail{grid-template-columns:var(--server-rail) minmax(0,1fr)!important}.main-stage{grid-column:2!important}.channel-sidebar{left:var(--server-rail)!important;top:0!important;bottom:0!important;width:min(330px,calc(100vw - var(--server-rail)))!important}.mobile-scrim{inset:0 0 0 var(--server-rail)!important}.mobile-menu-button{display:grid!important}
+  .roles-view,.notes-view{display:block!important;overflow-y:auto!important}.roles-list-panel,.note-list-panel{height:auto!important;max-height:300px!important;border-right:0!important;border-bottom:1px solid rgba(255,255,255,.06)!important}.role-editor-panel{overflow:visible!important}.note-editor-panel{min-height:480px!important}.comments-panel{width:auto!important;border-left:0!important;border-top:1px solid rgba(255,255,255,.06)!important}
+}
+
+/* Mobile keeps its dedicated v9 layout; custom desktop chrome never appears there. */
+@media(max-width:720px){.desktop-titlebar,.desktop-update-card{display:none!important}.tauri-desktop-content{position:static!important;inset:auto!important;height:100%!important}}
+
+@media(prefers-reduced-motion:reduce){.titlebar-update>i,.titlebar-update.working svg{animation:none!important}}
+
+/* 0.0.10 desktop hotfix — login slogan hierarchy */
+.login-brand .login-slogan {
+  max-width: 560px;
+  margin-top: 22px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 760;
+  line-height: 1.35;
+  letter-spacing: .01em;
+}
+.login-brand .login-slogan + p { margin-top: 9px; }
+@media (max-width: 720px) {
+  .login-brand .login-slogan { margin-top: 16px; font-size: 13px; }
+  .login-brand .login-slogan + p { margin-top: 7px; }
+}

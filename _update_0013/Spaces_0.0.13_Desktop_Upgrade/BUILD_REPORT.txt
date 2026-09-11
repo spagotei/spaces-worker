@@ -1,0 +1,19 @@
+Spaces 0.0.13 package validation
+================================
+
+Validated in this build environment:
+- 44 TS/TSX source files parsed with TypeScript 5.8 parser: PASS
+- Relative import graph: PASS (0 unresolved relative imports)
+- Worker JavaScript syntax (node --check): PASS
+- CSS block/brace balance: PASS
+- D1 migration 0013 smoke-applied to SQLite: PASS
+- Transparent icon alpha check (32/128/256/512): PASS
+- Browser/native Notification API references in app source: 0
+- Custom Spaces ping/notification code present: PASS
+- Discord-style channel overwrite editor + Worker enforcement present: PASS
+- Package release target: 0.0.13
+
+The container copy does not contain a complete local npm dependency tree for
+Vite/React type definitions, so the authoritative semantic typecheck and Vite
+production build are intentionally delegated to VERIFY_0.0.13.cmd on the
+actual SpacesApp installation, where node_modules is already installed.

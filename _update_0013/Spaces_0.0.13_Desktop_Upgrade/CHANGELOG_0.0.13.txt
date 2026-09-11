@@ -1,0 +1,18 @@
+Spaces 0.0.13 — Desktop foundation pass
+
+- Keeps the current minimal Spaces startup animation.
+- Replaces the old S desktop/taskbar/titlebar mark with the six-building Spaces skyline logo on a true transparent background.
+- Adds a one-time Welcome to Spaces introduction after the boot sequence.
+- Fixes the desktop updater behavior so update checks expose the purple download arrow instead of silently installing during the check.
+- Adds Discord-style per-channel permission overwrites for @everyone, custom roles, and individual members with Allow / Neutral / Deny.
+- Keeps Owner absolute and protected above every role.
+- Adds mention autocomplete for members, mentionable roles, @everyone, and @here, plus ping highlighting.
+- Adds Spaces-owned in-app notification cards and notification inbox so browser/hostname notification chrome is not used.
+- Adds ping notifications for direct mentions, mentionable roles, @everyone, and @here.
+- Improves desktop resizing so chat/content stays usable first; the people rail collapses before the main conversation area.
+- Adds Space picture editing and Space banner framing from Space Settings.
+- Adds profile/avatar/banner framing with zoom and horizontal/vertical adjustment.
+- Fixes profile banner propagation so saved banners immediately update the loaded People view and persist from the backend.
+- Shows member banners in People cards and profile panels.
+- Makes the Founder platform badge display consistently on the Founder profile, People cards, member rail, and profile role sections.
+- Keeps Staff platform identity distinct from regular Space roles.

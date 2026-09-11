@@ -1,0 +1,35 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "spaces",
+	"main": "src/worker.js",
+	"compatibility_date": "2026-09-04",
+	"observability": {
+		"enabled": true
+	},
+	"vars": {
+		"APP_NAME": "Spaces",
+		"SPACES_EMAIL_FROM": "security@yourspaces.net",
+		"SPACES_EMAIL_REPLY_TO": "support@yourspaces.net",
+		"ALLOWED_ORIGINS": "https://yourspaces.net,https://www.yourspaces.net"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "spaces",
+			"database_id": "22ae7556-2207-4546-a3fe-324135a0cb6b",
+			"migrations_dir": "migrations"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "DESKTOP_RELEASES",
+			"bucket_name": "spaces-desktop-releases"
+		}
+	],
+	"send_email": [
+		{
+			"name": "EMAIL",
+			"remote": true
+		}
+	]
+}

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+bad="$(git diff --cached --name-only --diff-filter=ACMR | grep -Ei '(^|/)(\.env($|\.)|\.dev\.vars($|\.)|\.wrangler/|[^/]+\.(pem|key|p12|pfx|sqlite|sqlite3|db|dump|bak|backup)$|credentials?[^/]*\.json$|client[_-]?secret[^/]*\.json$|service[_-]?account[^/]*\.json$)|^[^/]+\.sql$' || true)"
+
+if [ -n "$bad" ]; then
+  echo "SECURITY: blocked secret/database-like files from being committed:"
+  echo "$bad"
+  echo "Keep secrets local/outside Git. migrations/*.sql remains allowed."
+  exit 1
+fi

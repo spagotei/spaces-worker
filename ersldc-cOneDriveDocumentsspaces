@@ -1,0 +1,35 @@
+warning: in the working copy of 'wrangler.jsonc', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/wrangler.jsonc b/wrangler.jsonc[m
+[1mindex d3e7a3e..43c07f1 100644[m
+[1m--- a/wrangler.jsonc[m
+[1m+++ b/wrangler.jsonc[m
+[36m@@ -1,13 +1,15 @@[m
+ {[m
+   "$schema": "./node_modules/wrangler/config-schema.json",[m
+[31m-  "name": "scrounge-spaces-api",[m
+[32m+[m[32m  "name": "spaces",[m
+   "main": "src/worker.js",[m
+   "compatibility_date": "2026-09-04",[m
+   "observability": {[m
+     "enabled": true[m
+   },[m
+   "vars": {[m
+[31m-    "APP_NAME": "Scrounge Spaces"[m
+[32m+[m[32m    "APP_NAME": "Spaces",[m
+[32m+[m[32m    "SPACES_EMAIL_FROM": "security@yourspaces.net",[m
+[32m+[m[32m    "SPACES_EMAIL_REPLY_TO": "support@yourspaces.net"[m
+   },[m
+   "d1_databases": [[m
+     {[m
+[36m@@ -22,5 +24,11 @@[m
+       "binding": "DESKTOP_RELEASES",[m
+       "bucket_name": "spaces-desktop-releases"[m
+     }[m
+[32m+[m[32m  ],[m
+[32m+[m[32m  "send_email": [[m
+[32m+[m[32m    {[m
+[32m+[m[32m      "name": "EMAIL",[m
+[32m+[m[32m      "remote": true[m
+[32m+[m[32m    }[m
+   ][m
+ }[m

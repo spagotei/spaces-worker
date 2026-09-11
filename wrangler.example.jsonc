@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "spaces",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-04",
+  "observability": { "enabled": true },
+  "vars": { "APP_NAME": "Spaces" },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "spaces",
+      "database_id": "PASTE_YOUR_EXISTING_D1_DATABASE_ID_HERE",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

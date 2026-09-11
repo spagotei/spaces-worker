@@ -1,0 +1,9 @@
+Spaces 0.0.12
+
+- Fixed channel/category/note context actions and deletion paths.
+- Added Note TXT import, export, and update-from-TXT flows.
+- Restricted chat uploads to PNG, JPEG, WebP, and TXT with a small file-size cap.
+- Added in-app image previews for chat attachments.
+- Refined People profiles, avatar presence, Roles, menus, dropdowns, and interaction motion.
+- Added the polished startup/login motion pass and removed the shipping Device Lab launcher.
+- Regenerated the Windows icon from transparent PNG artwork.

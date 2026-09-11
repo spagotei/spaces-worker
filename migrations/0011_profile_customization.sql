@@ -1,0 +1,2 @@
+ALTER TABLE users ADD COLUMN banner_url TEXT;
+ALTER TABLE users ADD COLUMN profile_accent TEXT NOT NULL DEFAULT '#8b6ca8';

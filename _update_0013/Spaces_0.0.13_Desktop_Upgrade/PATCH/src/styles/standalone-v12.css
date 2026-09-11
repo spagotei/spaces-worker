@@ -1,0 +1,37 @@
+/* Spaces 0.0.12 — verified interaction/application pass */
+
+/* Make context-enabled rows visibly discoverable without turning them into noisy menus. */
+.channel-row,.context-enabled-label,.note-list-item{position:relative}
+.channel-row:after,.context-enabled-label:after{content:'⋯';margin-left:auto;color:#5f5966;font-size:12px;line-height:1;opacity:0;transform:translateX(-2px);transition:opacity .14s ease,transform .14s ease,color .14s ease}
+.channel-row:hover:after,.context-enabled-label:hover:after{opacity:1;transform:none;color:#aaa1b0}
+.channel-row:active,.note-list-item:active{transform:scale(.992)}
+.context-enabled-label{user-select:none;touch-action:pan-y}
+
+/* Status belongs to the avatar; status copy is text only, never a highlighted chip. */
+.profile-avatar-presence,.account-avatar-wrap,.account-quick-avatar,.member-detail-avatar,.rail-profile-avatar{position:relative!important}
+.profile-avatar-presence>.presence-symbol,.account-avatar-wrap>.status-dot,.account-quick-avatar>.presence-symbol,.member-detail-avatar>.presence-symbol,.rail-profile-avatar>.presence-symbol{position:absolute!important;right:-2px!important;bottom:-2px!important;z-index:6!important}
+.presence-text,.member-profile-status{padding:0!important;margin:0!important;border:0!important;border-radius:0!important;background:none!important;box-shadow:none!important;text-shadow:none!important}
+.presence-text-online{color:#58bd7b!important}.presence-text-idle{color:#d9ae56!important}.presence-text-dnd{color:#df6a72!important}.presence-text-offline{color:#7f838c!important}
+
+/* Roles read as a real profile subsection rather than a floating badge. */
+.profile-submenu,.member-detail-section.profile-submenu{overflow:hidden;border:1px solid rgba(255,255,255,.055)!important;border-radius:13px!important;background:rgba(255,255,255,.012)!important}
+.profile-submenu>summary{min-height:42px;padding:0 11px!important;cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.profile-submenu>summary::-webkit-details-marker{display:none}.profile-submenu>summary>span:first-child{display:flex;align-items:center;gap:7px}.profile-submenu>summary>span:last-child{color:#746e7a;font-size:8px}
+.profile-submenu[open]>summary{border-bottom:1px solid rgba(255,255,255,.045)}
+.profile-submenu .detail-section-body,.profile-submenu .rail-role-chips{padding:10px!important}
+
+/* Notes should make file round-tripping and deletion impossible to miss. */
+.note-editor-actions{display:flex!important;align-items:center!important;gap:6px!important;flex-wrap:wrap!important}
+.note-editor-actions .ghost-danger{margin-left:auto!important}
+.note-import-hint{border-style:solid!important;background:color-mix(in srgb,var(--app-accent) 3%,transparent)!important}
+
+/* Consistent tactile motion across desktop and touch. */
+button,.glass-select-trigger,input[type='range'],.toggle-track,.segmented-control button{transition:transform .14s cubic-bezier(.2,.8,.2,1),background-color .16s ease,border-color .16s ease,box-shadow .16s ease,opacity .16s ease!important}
+button:active:not(:disabled),.glass-select-trigger:active:not(:disabled){transform:scale(.975)}
+.glass-select-menu{border-radius:14px!important;overflow:hidden!important}.glass-select-menu>button{min-height:40px!important;border-radius:9px!important;margin:3px!important;width:calc(100% - 6px)!important}
+
+/* Transparent app artwork should not be re-boxed by in-app icon wrappers. */
+.titlebar-mark{background:transparent!important;border-color:color-mix(in srgb,var(--app-accent) 42%,rgba(255,255,255,.07))!important}
+
+@media (hover:none){.channel-row:after,.context-enabled-label:after,.note-list-item:after{opacity:.42!important}}
+@media (prefers-reduced-motion:reduce){button,.glass-select-trigger,input[type='range'],.toggle-track,.segmented-control button{transition:none!important}}

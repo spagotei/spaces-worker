@@ -1,0 +1,265 @@
+/* Spaces 0.0.8 — notification center, personal accent, hub visibility, emoji repair */
+
+:root {
+  --app-accent: #8b6ca8;
+}
+
+/* Personal accent keeps the base black while changing the chrome/highlight color. */
+.spaces-app-shell,
+.login-stage,
+.boot-screen {
+  --accent: var(--app-accent, #8b6ca8);
+}
+
+/* Boot: no glow/progress bar; skyline first, Spaces fills like liquid underneath. */
+.boot-screen.boot-city {
+  gap: 14px;
+  background: #08090c !important;
+}
+.boot-city-mark {
+  width: 176px;
+  height: 112px;
+  filter: none !important;
+  box-shadow: none !important;
+  animation: none !important;
+}
+.boot-city-mark .building {
+  box-shadow: none !important;
+  background: linear-gradient(180deg, rgba(255,255,255,.075), rgba(255,255,255,.014)) !important;
+}
+.boot-wordmark-v8 {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 42px;
+  margin-top: -2px;
+  animation: bootCopyIn .52s 1.1s both;
+}
+.boot-wordmark-v8 .boot-liquid-word {
+  position: relative;
+  display: inline-block;
+  font-size: 34px !important;
+  line-height: 1 !important;
+  font-weight: 780 !important;
+  letter-spacing: -.06em !important;
+  color: rgba(255,255,255,.12) !important;
+  -webkit-text-stroke: 1px rgba(255,255,255,.09);
+  background: none !important;
+  filter: none !important;
+  animation: none !important;
+  overflow: hidden;
+}
+.boot-wordmark-v8 .boot-liquid-word::after {
+  content: "Spaces";
+  position: absolute;
+  inset: 0;
+  color: transparent;
+  -webkit-text-stroke: 0;
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--app-accent) 38%, #f8f5fa) 0%,
+      color-mix(in srgb, var(--app-accent) 78%, #d8c6e8) 24%,
+      var(--app-accent) 55%,
+      color-mix(in srgb, var(--app-accent) 72%, #2a1538) 100%);
+  background-size: 100% 180%;
+  background-position: 50% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  clip-path: inset(100% 0 0 0);
+  animation: spacesLiquidFill 2.05s cubic-bezier(.22,.85,.2,1) 1.22s forwards,
+             spacesLiquidDrift 1.7s ease-in-out 2.15s infinite alternate;
+}
+.boot-progress { display: none !important; }
+.boot-version { margin-top: 2px; opacity: .46; }
+@keyframes spacesLiquidFill {
+  0% { clip-path: inset(100% 0 0 0); background-position: 50% 100%; }
+  55% { clip-path: inset(42% 0 0 0); background-position: 50% 66%; }
+  100% { clip-path: inset(0 0 0 0); background-position: 50% 28%; }
+}
+@keyframes spacesLiquidDrift {
+  from { background-position: 50% 22%; filter: brightness(.98); }
+  to { background-position: 50% 36%; filter: brightness(1.08); }
+}
+
+/* Notification button + dropdown */
+.notification-button { position: relative; }
+.notification-button > i {
+  position: absolute;
+  right: -2px;
+  top: -3px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  border: 2px solid #0b0c10;
+  background: var(--app-accent);
+  color: white;
+  font-style: normal;
+  font-size: 7px;
+  font-weight: 800;
+}
+.notification-center-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 78;
+  background: transparent;
+  cursor: default;
+}
+.notification-center {
+  position: fixed;
+  z-index: 79;
+  right: 18px;
+  top: 56px;
+  width: min(390px, calc(100vw - 28px));
+  max-height: min(620px, 72vh);
+  display: grid;
+  grid-template-rows: auto minmax(0,1fr);
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,.105);
+  border-radius: 18px;
+  background: rgba(13,14,19,.98);
+  box-shadow: 0 26px 90px rgba(0,0,0,.56), inset 0 1px rgba(255,255,255,.035);
+  backdrop-filter: blur(28px);
+  transform-origin: top right;
+  animation: notificationDrop .26s cubic-bezier(.18,.9,.2,1) both;
+}
+.notification-center::before {
+  content:"";
+  position:absolute;
+  inset:0;
+  pointer-events:none;
+  background: linear-gradient(145deg, color-mix(in srgb,var(--app-accent) 8%,transparent), transparent 32%);
+}
+.notification-center > header {
+  position: relative;
+  z-index: 1;
+  min-height: 62px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding: 11px 13px;
+  border-bottom:1px solid rgba(255,255,255,.055);
+}
+.notification-center > header > div:first-child { display:grid; gap:5px; }
+.notification-center > header strong { font-size:14px; }
+.notification-center > header > div:last-child { display:flex; align-items:center; gap:5px; }
+.notification-clear { background:transparent; color:#aaa4af; font-size:8px; cursor:pointer; }
+.notification-clear:hover { color:#fff; }
+.notification-center-list { position:relative; z-index:1; min-height:0; overflow:auto; padding:8px; }
+.notification-card {
+  width:100%;
+  display:grid;
+  grid-template-columns:auto minmax(0,1fr) auto;
+  align-items:start;
+  gap:9px;
+  padding:10px;
+  border-radius:12px;
+  background:transparent;
+  color:inherit;
+  text-align:left;
+  cursor:pointer;
+  transition:background .16s, transform .16s;
+}
+.notification-card:hover { background:rgba(255,255,255,.045); transform:translateX(2px); }
+.notification-card-icon { width:30px; height:30px; display:grid; place-items:center; border:1px solid color-mix(in srgb,var(--app-accent) 26%,rgba(255,255,255,.07)); border-radius:9px; color:color-mix(in srgb,var(--app-accent) 78%,white); background:color-mix(in srgb,var(--app-accent) 8%,transparent); }
+.notification-card > div { min-width:0; display:grid; gap:3px; }
+.notification-card > div > div { display:flex; align-items:center; gap:8px; }
+.notification-card strong { font-size:10px; }
+.notification-card time { margin-left:auto; color:#68636e; font-size:7px; }
+.notification-card span { color:#8a8490; font-size:8px; }
+.notification-card p { margin:1px 0 0; color:#c4bec9; font-size:9px; line-height:1.45; overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+.notification-card > svg { align-self:center; color:#625e68; }
+.notification-empty { min-height:190px; display:grid; place-items:center; align-content:center; gap:8px; padding:30px; text-align:center; }
+.notification-empty-icon { width:44px; height:44px; display:grid; place-items:center; border-radius:14px; color:#8c8691; background:rgba(255,255,255,.035); }
+.notification-empty strong { font-size:11px; }
+.notification-empty p { max-width:260px; margin:0; color:#77727d; font-size:9px; line-height:1.5; }
+@keyframes notificationDrop { from { opacity:0; transform:translateY(-10px) scale(.965); } to { opacity:1; transform:none; } }
+
+.hero-missed.has-items { cursor:pointer; transition:transform .2s cubic-bezier(.2,.9,.2,1), border-color .2s, background .2s; }
+.hero-missed.has-items:hover { transform:translateY(-2px); border-color:color-mix(in srgb,var(--app-accent) 28%,rgba(255,255,255,.08)); background:color-mix(in srgb,var(--app-accent) 4%,rgba(255,255,255,.018)); }
+
+/* Hidden Spaces remain reversible; hiding never means leaving. */
+.hidden-spaces-strip {
+  margin-top: 10px;
+  min-height: 42px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:7px 10px;
+  border:1px solid rgba(255,255,255,.05);
+  border-radius:12px;
+  background:rgba(255,255,255,.012);
+}
+.hidden-spaces-strip > div { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.hidden-spaces-strip > div:first-child { color:#78737e; font-size:8px; }
+.hidden-spaces-strip button { min-height:26px; padding:0 8px; border-radius:8px; background:rgba(255,255,255,.035); color:#aaa4ae; font-size:7px; cursor:pointer; }
+.hidden-spaces-strip button:hover { color:#fff; background:rgba(255,255,255,.06); }
+
+/* Appearance accent editor */
+.accent-preference-row { align-items:center !important; }
+.personal-accent-picker { min-width:250px; display:grid; grid-template-columns:42px auto 1fr; align-items:center; gap:9px; }
+.personal-accent-picker > input[type="color"] { width:42px; height:34px; padding:2px; border:1px solid rgba(255,255,255,.09); border-radius:9px; background:#0e0f14; cursor:pointer; }
+.personal-accent-picker code { color:#918b96; font-size:8px; }
+.accent-swatches { display:flex; justify-content:flex-end; gap:5px; }
+.accent-swatches button { width:21px; height:21px; border-radius:7px; box-shadow:inset 0 0 0 1px rgba(255,255,255,.14); cursor:pointer; transition:transform .14s, box-shadow .14s; }
+.accent-swatches button:hover { transform:scale(1.08); }
+.accent-swatches button.active { box-shadow:0 0 0 2px #111218,0 0 0 3px rgba(255,255,255,.72); }
+
+/* Per-space notification/hide controls */
+.space-notification-controls { margin-top:16px; }
+.space-preference-list { display:grid; gap:5px; }
+.space-preference-row { min-height:54px; display:grid; grid-template-columns:auto minmax(0,1fr) auto auto; align-items:center; gap:9px; padding:8px; border:1px solid rgba(255,255,255,.05); border-radius:12px; background:rgba(255,255,255,.012); }
+.space-preference-row > div { min-width:0; display:grid; gap:2px; }
+.space-preference-row strong { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:9px; }
+.space-preference-row span { color:#77727d; font-size:7px; }
+.mini-toggle { min-height:28px; display:inline-flex; align-items:center; gap:5px; padding:0 8px; border:1px solid rgba(255,255,255,.06); border-radius:8px; background:rgba(255,255,255,.02); color:#928c97; font-size:7px; cursor:pointer; }
+.mini-toggle:hover,.mini-toggle.active { border-color:color-mix(in srgb,var(--app-accent) 28%,rgba(255,255,255,.08)); background:color-mix(in srgb,var(--app-accent) 7%,transparent); color:#ddd8e1; }
+
+/* Emoji picker hard reset: older generic .emoji-popover button aspect-ratio styles were crushing the layout. */
+.emoji-popover-v3 { left:auto !important; max-height:none !important; overflow:hidden !important; padding:0 !important; gap:0 !important; }
+.emoji-popover-v3 button { aspect-ratio:auto !important; min-width:0 !important; }
+.emoji-popover-v3 .emoji-picker-head { display:flex !important; max-height:none !important; overflow:visible !important; }
+.emoji-popover-v3 .emoji-search { display:grid !important; max-height:none !important; overflow:visible !important; }
+.emoji-popover-v3 .emoji-category-tabs { display:flex !important; gap:3px !important; overflow-x:auto !important; overflow-y:hidden !important; max-height:none !important; padding:4px 8px 7px !important; scrollbar-width:none; }
+.emoji-popover-v3 .emoji-category-tabs::-webkit-scrollbar { display:none; }
+.emoji-popover-v3 .emoji-category-tabs button { flex:0 0 32px !important; width:32px !important; height:31px !important; padding:0 !important; aspect-ratio:auto !important; }
+.emoji-popover-v3 .emoji-picker-scroll { display:block !important; min-width:0 !important; min-height:0 !important; max-height:none !important; overflow-y:auto !important; overflow-x:hidden !important; }
+.emoji-popover-v3 .emoji-picker-scroll section { display:block !important; max-height:none !important; overflow:visible !important; }
+.emoji-popover-v3 .emoji-native-grid { width:100% !important; display:grid !important; grid-template-columns:repeat(auto-fill,minmax(36px,1fr)) !important; gap:3px !important; }
+.emoji-popover-v3 .emoji-native-grid button { width:100% !important; min-height:36px !important; aspect-ratio:1 !important; padding:0 !important; font-size:20px !important; }
+.emoji-popover-v3 .emoji-spaces-grid { width:100% !important; display:grid !important; grid-template-columns:repeat(auto-fill,minmax(64px,1fr)) !important; gap:5px !important; }
+.emoji-popover-v3 .emoji-spaces-grid button { min-height:62px !important; padding:6px !important; aspect-ratio:auto !important; }
+.emoji-popover-v3 .emoji-spaces-grid img { width:31px !important; height:31px !important; border-radius:8px !important; }
+.spaces-preset-emoji-grid img { object-fit:contain; background:#111218; }
+
+/* Profile status belongs with identity rather than a green highlighted label. */
+.rail-profile-card { position:relative; }
+.rail-profile-avatar { position:relative; width:max-content; margin-left:16px; margin-top:-36px; }
+.rail-profile-avatar > .presence-symbol { position:absolute; right:-3px; bottom:-3px; width:17px !important; height:17px !important; border-width:4px !important; border-color:#0e0f14 !important; }
+.rail-profile-card > .avatar { display:none; }
+.rail-profile-name-row { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+.member-profile-status { display:inline-flex; align-items:center; gap:5px; color:#817b87; font-size:8px; }
+.member-profile-status .presence-symbol { width:11px !important; height:11px !important; border-width:2px !important; border-color:#111218 !important; }
+.rail-profile-handle { color:#77717c; font-size:8px; }
+.rail-profile-custom-status { margin:2px 0 1px; color:#c9c3cd; font-size:9px; line-height:1.45; }
+.quick-status-input > span { display:flex; justify-content:space-between; }
+.quick-status-input small { color:#5f5a64; font-size:7px; letter-spacing:0; }
+
+/* Use the personal accent on app chrome; server identity remains available as --workspace-accent. */
+.server-button { --server-accent: var(--workspace-accent, var(--app-accent)); }
+.bg-violet-grid::before { background:radial-gradient(circle at 74% 0%,color-mix(in srgb,var(--workspace-accent,var(--app-accent)) 18%,transparent),transparent 42%),#09080d; }
+.bg-glassline::before { background:linear-gradient(120deg,rgba(255,255,255,.018),transparent 35%),radial-gradient(circle at 70% 0%,color-mix(in srgb,var(--workspace-accent,var(--app-accent)) 12%,transparent),transparent 45%),#09090c; }
+
+@media(max-width:680px){
+  .notification-center { top:54px; right:8px; left:8px; width:auto; max-height:70vh; }
+  .personal-accent-picker { min-width:0; width:100%; grid-template-columns:42px auto; }
+  .accent-swatches { grid-column:1/-1; justify-content:flex-start; }
+  .space-preference-row { grid-template-columns:auto minmax(0,1fr); }
+  .space-preference-row .mini-toggle { grid-row:2; }
+  .hidden-spaces-strip { align-items:flex-start; flex-direction:column; }
+  .emoji-popover-v3 .emoji-native-grid { grid-template-columns:repeat(7,minmax(0,1fr)) !important; }
+}
