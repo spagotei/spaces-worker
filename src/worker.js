@@ -4233,6 +4233,106 @@ async function sendDirectConversationMessage(request, env, conversationId) {
     return json({ id, conversationId, senderUserId: auth.user.id, senderName: auth.user.display_name, body: messageBody, createdAt: now }, 201);
 }
 
+async function directPinnedThreadAccess(env, userId, kind, threadId) {
+    if (kind === 'dm') {
+        const row = await directConversationForUser(env, threadId, userId);
+        return row && row.status === 'accepted' ? row : null;
+    }
+
+    if (kind === 'group') {
+        const row = await env.DB.prepare(
+            `SELECT g.id
+             FROM direct_groups g
+             JOIN direct_group_members gm ON gm.group_id = g.id
+             WHERE g.id = ? AND gm.user_id = ?
+             LIMIT 1`
+        ).bind(threadId, userId).first();
+        return row ?? null;
+    }
+
+    return null;
+}
+
+async function listDirectPinnedMessages(request, env, kind, threadId) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+
+    const access = await directPinnedThreadAccess(env, auth.user.id, kind, threadId);
+    if (!access) return fail('Direct thread not found.', 404);
+
+    const table = kind === 'dm' ? 'direct_messages' : 'direct_group_messages';
+    const threadColumn = kind === 'dm' ? 'conversation_id' : 'group_id';
+
+    const result = await env.DB.prepare(
+        `SELECT
+           p.message_id,
+           p.pinned_by,
+           p.pinned_at,
+           m.sender_user_id,
+           m.body,
+           m.created_at,
+           u.display_name AS sender_name
+         FROM direct_message_pins p
+         JOIN ${table} m ON m.id = p.message_id
+         JOIN users u ON u.id = m.sender_user_id
+         WHERE p.thread_kind = ?
+           AND p.thread_id = ?
+           AND m.${threadColumn} = ?
+         ORDER BY p.pinned_at DESC
+         LIMIT 100`
+    ).bind(kind, threadId, threadId).all();
+
+    return json((result.results ?? []).map(row => ({
+        id: row.message_id,
+        senderUserId: row.sender_user_id,
+        senderName: row.sender_name,
+        body: row.body,
+        createdAt: Number(row.created_at ?? 0),
+        pinnedBy: row.pinned_by,
+        pinnedAt: Number(row.pinned_at ?? 0),
+    })));
+}
+
+async function updateDirectPinnedMessage(request, env, kind, threadId, messageId, pin) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+
+    const access = await directPinnedThreadAccess(env, auth.user.id, kind, threadId);
+    if (!access) return fail('Direct thread not found.', 404);
+
+    const table = kind === 'dm' ? 'direct_messages' : 'direct_group_messages';
+    const threadColumn = kind === 'dm' ? 'conversation_id' : 'group_id';
+    const message = await env.DB.prepare(
+        `SELECT id FROM ${table}
+         WHERE id = ? AND ${threadColumn} = ?
+         LIMIT 1`
+    ).bind(messageId, threadId).first();
+
+    if (!message) return fail('Message not found in this thread.', 404);
+
+    if (pin) {
+        const now = Date.now();
+        await env.DB.prepare(
+            `INSERT INTO direct_message_pins
+              (thread_kind, thread_id, message_id, pinned_by, pinned_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(thread_kind, thread_id, message_id)
+             DO UPDATE SET pinned_by = excluded.pinned_by, pinned_at = excluded.pinned_at`
+        ).bind(kind, threadId, messageId, auth.user.id, now).run();
+
+        return json({ messageId, pinnedAt: now });
+    }
+
+    await env.DB.prepare(
+        `DELETE FROM direct_message_pins
+         WHERE thread_kind = ?
+           AND thread_id = ?
+           AND message_id = ?`
+    ).bind(kind, threadId, messageId).run();
+
+    return new Response(null, { status: 204, headers: corsHeaders() });
+}
+
 async function getWorkspaceDmPreference(request, env, workspaceId) {
     const access = await requireWorkspaceMembership(request, env, workspaceId);
     if ('response' in access) return access.response;
@@ -11041,6 +11141,26 @@ export default {
                     env,
                     decodeURIComponent(directPreferenceRoute[1] ?? ''),
                     decodeURIComponent(directPreferenceRoute[2] ?? ''),
+                );
+            }
+            const directPinsListRoute = url.pathname.match(/^\/v1\/direct\/pins\/(dm|group)\/([^/]+)$/u);
+            if (request.method === 'GET' && directPinsListRoute) {
+                return listDirectPinnedMessages(
+                    request,
+                    env,
+                    decodeURIComponent(directPinsListRoute[1] ?? ''),
+                    decodeURIComponent(directPinsListRoute[2] ?? ''),
+                );
+            }
+            const directPinItemRoute = url.pathname.match(/^\/v1\/direct\/pins\/(dm|group)\/([^/]+)\/([^/]+)$/u);
+            if ((request.method === 'PUT' || request.method === 'DELETE') && directPinItemRoute) {
+                return updateDirectPinnedMessage(
+                    request,
+                    env,
+                    decodeURIComponent(directPinItemRoute[1] ?? ''),
+                    decodeURIComponent(directPinItemRoute[2] ?? ''),
+                    decodeURIComponent(directPinItemRoute[3] ?? ''),
+                    request.method === 'PUT',
                 );
             }
             if (request.method === 'POST' && url.pathname === '/v1/direct/groups') {
