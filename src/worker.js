@@ -1,3 +1,8 @@
+import { handleSpacesProgramsV90 } from './space-programs-v90.mjs'; // SPACES_V90_PROGRAM_API
+import { routeNotesFoldersV89 } from './notes-folders-v89.mjs'; // SPACES_V89_NOTE_FOLDERS_IMPORT
+import { finishDmCallV85, finalizeExpiredDmCallsV85, getDmCallEventsV85, missedDmNotificationsV85 } from './voice-dm-events-v85.mjs'; // SPACES_V85_HISTORY_IMPORT
+import { recordFailedLoginV85, recordStaffDeniedV85 } from './security-audit-v85.mjs'; // SPACES_V85_SECURITY_IMPORT
+import { createStaffCenter, receiveStaffEmail } from './staff-inbox-v84-3.mjs'; // SPACES_V84_3_INBOX_IMPORT
 const encoder = new TextEncoder();
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 const MAX_JSON_BODY_BYTES = 900000;
@@ -18,7 +23,7 @@ function corsHeaders() {
         // wildcard remains here so native/Tauri clients and approved browser
         // origins receive compatible API responses without cookies.
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Bootstrap-Secret',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Bootstrap-Secret, X-Spaces-Developer-Mode',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
         'Access-Control-Max-Age': '86400',
         'Cache-Control': 'no-store, max-age=0',
@@ -570,6 +575,8 @@ function noteCommentFromRow(row) {
         editedAt: row.edited_at ?? null,
         deletedAt: row.deleted_at ?? null,
         deletedBy: row.deleted_by ?? null,
+        parentCommentId: row.parent_comment_id ?? null,
+        authorUsername: row.author_username ?? '',
     };
 }
 
@@ -1308,7 +1315,8 @@ async function workspaceBootstrap(request, env, workspaceId) {
            u.bio,
            u.platform_role,
            u.presence_status,
-           u.custom_status
+           u.custom_status,
+           u.updated_at AS presence_seen_at
          FROM space_members sm
          JOIN users u
            ON u.id = sm.user_id
@@ -1389,7 +1397,7 @@ async function workspaceBootstrap(request, env, workspaceId) {
         `SELECT
            m.id, m.space_id, m.channel_id, m.author_id, m.body,
            m.created_at, m.edited_at, m.deleted_at, m.deleted_by,
-           m.attachment_name, m.attachment_type, m.attachment_size,
+           m.attachment_name, m.attachment_type, m.attachment_size, m.reply_to_message_id,
            u.display_name AS author_name,
            u.username AS author_username
          FROM messages m
@@ -1522,7 +1530,7 @@ async function workspaceBootstrap(request, env, workspaceId) {
                     platformRole: clientPlatformRole(member.platform_role),
                     role: member.role,
                     customRoleIds: memberRoles.get(member.id) ?? [],
-                    status: memberPresence(member.presence_status),
+                    status: memberPresence(member.presence_status, member.presence_seen_at),
                     customStatus: String(member.custom_status ?? ''),
                     joinedAt: member.joined_at,
                 }),
@@ -1565,7 +1573,9 @@ async function workspaceBootstrap(request, env, workspaceId) {
                     editedAt: message.edited_at,
                     deletedAt: message.deleted_at ?? null,
                     deletedBy: message.deleted_by ?? null,
-                    attachment: messageAttachmentFromRow(message),
+                    attachment:
+                        messageAttachmentFromRow(message),
+                    replyToMessageId: message.reply_to_message_id ?? null,
                 }),
             ),
 
@@ -1761,7 +1771,8 @@ async function workspaceSync(
                    u.avatar_url,
                    u.platform_role,
                    u.presence_status,
-                   u.custom_status
+                   u.custom_status,
+                   u.updated_at AS presence_seen_at
                  FROM space_members sm
                  JOIN users u
                    ON u.id = sm.user_id
@@ -1846,6 +1857,7 @@ async function workspaceSync(
                m.attachment_name,
                m.attachment_type,
                m.attachment_size,
+               m.reply_to_message_id,
                u.display_name AS author_name,
                u.username AS author_username
              FROM messages m
@@ -1961,7 +1973,7 @@ async function workspaceSync(
                         customRoleIds:
                             memberRoles.get(member.id) ?? [],
                         status:
-                            memberPresence(member.presence_status),
+                            memberPresence(member.presence_status, member.presence_seen_at),
                         customStatus:
                             String(member.custom_status ?? ''),
                         joinedAt:
@@ -2032,6 +2044,7 @@ async function workspaceSync(
                         message.deleted_by ?? null,
                     attachment:
                         messageAttachmentFromRow(message),
+                    replyToMessageId: message.reply_to_message_id ?? null,
                 }),
             ),
 
@@ -2216,11 +2229,16 @@ async function requireSupportConsole(request, env) {
     return { user: auth.user };
 }
 
+function supportRoleRankV70(role) {
+    if (role === 'creator') return 4;
+    if (role === 'staff') return 3;
+    if (role === 'support') return 2;
+    return 1;
+}
+
 function supportRoleCanActOn(actorRole, targetRole) {
-    if (actorRole === 'creator') return targetRole !== 'creator';
-    if (actorRole === 'staff') return targetRole !== 'creator' && targetRole !== 'staff';
-    if (actorRole === 'support') return !targetRole;
-    return false;
+    if (targetRole === 'creator') return false;
+    return supportRoleRankV70(actorRole) > supportRoleRankV70(targetRole);
 }
 
 function publicProfile(user) {
@@ -2352,6 +2370,12 @@ async function authUser(request, env) {
             .bind(row.id)
             .run();
 
+        return null;
+    }
+
+    const v77PlatformRestriction = row.platform_role === 'creator' ? null : await activeSupportRestrictionV77(env, 'user', row.id, 'platform_access');
+    if (v77PlatformRestriction) {
+        await env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(row.id).run();
         return null;
     }
 
@@ -2702,22 +2726,14 @@ async function startBetaClaim(request, env) {
     ).bind(id, email, codeHash, now, expiresAt).run();
 
     try {
+        const messageV76 = renderSpacesCodeEmailV76({ kind: 'invite', code, expiresMinutes: Math.max(1, Math.round(EMAIL_CODE_TTL_MS / 60000)) });
         await env.EMAIL.send({
             to: email,
             from: { email: sender, name: 'Spaces' },
-            replyTo:
-                String(env.SPACES_EMAIL_REPLY_TO ?? '').trim() ||
-                sender,
-            subject: 'Verify your Spaces beta invite',
-            text:
-                `Your Spaces verification code is ${code}. ` +
-                `It expires in 10 minutes. Enter this code before choosing your username and password.`,
-            html:
-                `<div style="font-family:Arial,sans-serif;background:#0b0b0f;color:#f4f1f7;padding:28px">` +
-                `<h2 style="margin:0 0 12px">Verify your Spaces beta invite</h2>` +
-                `<p style="color:#b7afbf">Enter this code in Spaces before creating your account. It expires in 10 minutes.</p>` +
-                `<div style="font-size:32px;letter-spacing:8px;font-weight:700;padding:18px 0">${code}</div>` +
-                `<p style="color:#82798a;font-size:13px">If you did not request this, you can ignore this message.</p></div>`,
+            replyTo: String(env.SPACES_EMAIL_REPLY_TO ?? '').trim() || sender,
+            subject: messageV76.subject,
+            text: messageV76.text,
+            html: messageV76.html,
         });
     } catch (error) {
         console.error('Beta claim verification email failed.', error);
@@ -3089,7 +3105,7 @@ async function login(request, env) {
         : validUsername(identifier);
 
     if (!identifierIsValid) {
-        return fail('Invalid username or password.', 401);
+        await recordFailedLoginV85(env,request,identifier); return fail('Invalid username or password.', 401);
     }
 
     const passwordVerifier = body.passwordVerifier ?? '';
@@ -3108,7 +3124,7 @@ async function login(request, env) {
         ).bind(identifier).first();
 
     if (!user) {
-        return fail('Invalid username or password.', 401);
+        await recordFailedLoginV85(env,request,identifier); return fail('Invalid username or password.', 401);
     }
 
     const validPassword = await verifyPasswordVerifier(
@@ -3118,7 +3134,7 @@ async function login(request, env) {
     );
 
     if (!validPassword) {
-        return fail('Invalid username or password.', 401);
+        await recordFailedLoginV85(env,request,identifier); return fail('Invalid username or password.', 401);
     }
 
     const ban = await activePlatformBan(
@@ -3521,6 +3537,35 @@ async function getAccountSecurity(request, env) {
     return json(await accountSecurityStatus(env, fresh));
 }
 
+function renderSpacesCodeEmailV76({ kind, code, expiresMinutes = 10 }) {
+    const variant = String(kind || 'verification');
+    const copy = variant === 'invite'
+        ? { eyebrow: 'INVITE CODE', heading: 'Confirm your Spaces invite', intro: 'Use this code to continue setting up your Spaces account.' }
+        : variant === 'signin'
+            ? { eyebrow: 'SIGN-IN CODE', heading: 'Sign in to Spaces', intro: 'Use this one-time code to finish signing in.' }
+            : variant === 'security'
+                ? { eyebrow: 'CODE REQUESTED', heading: 'Confirm your security action', intro: 'Use this code to confirm the security change you requested.' }
+                : { eyebrow: 'EMAIL VERIFICATION', heading: 'Verify your Spaces email', intro: 'Use this code to verify the email address on your Spaces account.' };
+    const subjectPrefix = variant === 'invite' ? 'Your Spaces invite code' : variant === 'signin' ? 'Your Spaces sign-in code' : 'Your Spaces verification code';
+    const subject = `${subjectPrefix}: ${code}`;
+    const text = [
+        copy.eyebrow,
+        '',
+        copy.heading,
+        copy.intro,
+        '',
+        String(code),
+        '',
+        `Expires in ${expiresMinutes} minutes.`,
+        'Never share this code with anyone. Spaces Support will never ask you for it.',
+        'If you did not request this, you can safely ignore this email.',
+        '',
+        'Spaces by Spagotei',
+    ].join('\n');
+    const html = `<!doctype html><html><body style="margin:0;background:#09080d;color:#f4f1f7;font-family:Inter,Segoe UI,Arial,sans-serif"><div style="display:none;max-height:0;overflow:hidden;opacity:0">${copy.heading} · code ${code}</div><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#09080d;padding:28px 12px"><tr><td align="center"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#100e15;border:1px solid #26202d;border-radius:18px;overflow:hidden"><tr><td style="padding:28px 30px 12px"><div style="display:inline-block;width:30px;height:30px;line-height:30px;text-align:center;border-radius:9px;background:#8b6ca8;color:white;font-weight:800">S</div><span style="margin-left:10px;font-size:15px;font-weight:800;letter-spacing:.06em;color:#f5eff9">SPACES</span></td></tr><tr><td style="padding:8px 30px 30px"><div style="font-size:10px;font-weight:800;letter-spacing:.16em;color:#a88abd">${copy.eyebrow}</div><h1 style="margin:10px 0 8px;font-size:24px;line-height:1.25;color:#faf7fc">${copy.heading}</h1><p style="margin:0 0 22px;color:#b9b0bf;font-size:14px;line-height:1.6">${copy.intro}</p><div style="border:1px solid #392d43;background:#0b0a0f;border-radius:14px;padding:21px 16px;text-align:center"><div style="font-size:10px;letter-spacing:.14em;color:#817788;margin-bottom:9px">YOUR CODE</div><div style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:34px;line-height:1.1;letter-spacing:8px;font-weight:800;color:#ffffff;user-select:all">${code}</div><div style="font-size:11px;color:#776f7e;margin-top:10px">Select or copy this code · Expires in ${expiresMinutes} minutes</div></div><p style="margin:20px 0 0;color:#8e8495;font-size:12px;line-height:1.6">Never share this code with anyone. Spaces Support will never ask you for it.</p><p style="margin:7px 0 0;color:#706878;font-size:12px;line-height:1.6">If you did not request this, you can safely ignore this email.</p></td></tr><tr><td style="border-top:1px solid #211c26;padding:16px 30px;color:#625a69;font-size:11px">Spaces by Spagotei</td></tr></table></td></tr></table></body></html>`;
+    return { subject, text, html };
+}
+
 async function startAccountEmailVerification(request, env) {
     const auth = await requireUser(request, env);
     if ('response' in auth) return auth.response;
@@ -3575,13 +3620,14 @@ async function startAccountEmailVerification(request, env) {
     ).bind(id, auth.user.id, email, codeHash, now, expiresAt).run();
 
     try {
+        const messageV76 = renderSpacesCodeEmailV76({ kind: 'verification', code, expiresMinutes: Math.max(1, Math.round(EMAIL_CODE_TTL_MS / 60000)) });
         await env.EMAIL.send({
             to: email,
             from: { email: sender, name: 'Spaces' },
             replyTo: String(env.SPACES_EMAIL_REPLY_TO ?? '').trim() || sender,
-            subject: 'Verify your Spaces email',
-            text: `Your Spaces verification code is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.`,
-            html: `<div style="font-family:Arial,sans-serif;background:#0b0b0f;color:#f4f1f7;padding:28px"><h2 style="margin:0 0 12px">Verify your Spaces email</h2><p style="color:#b7afbf">Enter this code in Spaces. It expires in 10 minutes.</p><div style="font-size:32px;letter-spacing:8px;font-weight:700;padding:18px 0">${code}</div><p style="color:#82798a;font-size:13px">If you did not request this, you can ignore this message.</p></div>`,
+            subject: messageV76.subject,
+            text: messageV76.text,
+            html: messageV76.html,
         });
     }
     catch (error) {
@@ -3648,8 +3694,10 @@ async function beginAccountTwoFactorSetup(request, env) {
          ON CONFLICT(user_id) DO UPDATE SET secret = excluded.secret, created_at = excluded.created_at, expires_at = excluded.expires_at`
     ).bind(auth.user.id, secret, now, expiresAt).run();
 
-    const label = encodeURIComponent(`Spaces:${fresh.username}`);
-    const issuer = encodeURIComponent('Spaces');
+    // SPACES_V77_7_AUTHY_BRAND: use a unique issuer so Authy does not confuse Spaces with another service.
+    const SPACES_TOTP_ISSUER_V777 = 'Spaces by Spagotei';
+    const label = encodeURIComponent(`${SPACES_TOTP_ISSUER_V777}:@${fresh.username}`);
+    const issuer = encodeURIComponent(SPACES_TOTP_ISSUER_V777);
     const otpauthUri = `otpauth://totp/${label}?secret=${encodeURIComponent(secret)}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
     return json({ secret, otpauthUri, expiresAt });
 }
@@ -3756,7 +3804,7 @@ function directPerson(user) {
         avatarUrl: user.avatar_url ?? null,
         profileAccent: normalizeHexColor(user.profile_accent),
         platformRole: clientPlatformRole(user.platform_role),
-        presence: publicVisiblePresence(user.presence_status),
+        presence: publicVisiblePresence(user.presence_status, user.updated_at),
         customStatus: String(user.custom_status ?? ''),
     };
 }
@@ -3860,7 +3908,7 @@ async function createDirectGroup(request, env) {
         .map(value => String(value ?? '').trim())
         .filter(value => value && value !== auth.user.id))];
     if (memberUserIds.length < 1) return fail('Choose at least one friend for the group.');
-    if (memberUserIds.length > 9) return fail('Group chats support up to 10 people total during beta.', 400);
+    if (memberUserIds.length > 19) return fail('Group chats support up to 20 members total.', 400);
 
     for (const userId of memberUserIds) {
         const target = await env.DB.prepare(`SELECT id FROM users WHERE id = ? LIMIT 1`).bind(userId).first();
@@ -3913,6 +3961,7 @@ async function listDirectGroupMessages(request, env, groupId) {
     if ('response' in auth) return auth.response;
     const row = await directGroupForUser(env, groupId, auth.user.id);
     if (!row) return fail('Group chat not found.', 404);
+    await upsertNotificationReadCursorV72(env, auth.user.id, 'group', groupId, Date.now());
     const result = await env.DB.prepare(`SELECT m.id, m.group_id, m.sender_user_id, m.body, m.created_at, u.display_name AS sender_name
       FROM direct_group_messages m JOIN users u ON u.id = m.sender_user_id
       WHERE m.group_id = ? ORDER BY m.created_at ASC LIMIT 500`)
@@ -3931,6 +3980,8 @@ async function listDirectGroupMessages(request, env, groupId) {
 async function sendDirectGroupMessage(request, env, groupId) {
     const auth = await requireUser(request, env);
     if ('response' in auth) return auth.response;
+    const v77GroupRestriction = auth.user.platform_role === 'creator' ? null : (await activeSupportRestrictionV77(env, 'user', auth.user.id, 'direct_messages') || await activeSupportRestrictionV77(env, 'user', auth.user.id, 'send_messages'));
+    if (v77GroupRestriction) return fail('Your account is currently view-only for group messages.', 403);
     await enforceRateLimit(request, env, 'direct-group-message', 300, 1000 * 60 * 60, auth.user.id);
     const row = await directGroupForUser(env, groupId, auth.user.id);
     if (!row) return fail('Group chat not found.', 404);
@@ -3945,6 +3996,91 @@ async function sendDirectGroupMessage(request, env, groupId) {
     return json({ id, groupId, senderUserId: auth.user.id, senderName: auth.user.display_name, body: messageBody, createdAt: now }, 201);
 }
 
+// SPACES_DIRECT_GROUP_INVITE_V67
+async function addDirectGroupMemberV67(request, env, groupId) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+
+    const group = await directGroupForUser(env, groupId, auth.user.id);
+    if (!group) return fail('Group chat not found.', 404);
+
+    const body = await readJson(request);
+    const userId = String(body.userId ?? '').trim();
+
+    if (!userId || userId === auth.user.id) {
+        return fail('Choose another Spaces user to invite.', 400);
+    }
+
+    const target = await env.DB.prepare(
+        `SELECT id FROM users WHERE id = ? LIMIT 1`
+    ).bind(userId).first();
+
+    if (!target) return fail('That Spaces user was not found.', 404);
+
+    const existing = await env.DB.prepare(
+        `SELECT 1
+         FROM direct_group_members
+         WHERE group_id = ? AND user_id = ?
+         LIMIT 1`
+    ).bind(groupId, userId).first();
+
+    if (existing) {
+        const current = await env.DB.prepare(
+            `SELECT * FROM direct_groups WHERE id = ? LIMIT 1`
+        ).bind(groupId).first();
+        return json(await directGroupPayload(env, current, auth.user.id));
+    }
+
+    const blocked = await env.DB.prepare(
+        `SELECT 1
+         FROM user_blocks
+         WHERE (blocker_user_id = ? AND blocked_user_id = ?)
+            OR (blocker_user_id = ? AND blocked_user_id = ?)
+         LIMIT 1`
+    ).bind(auth.user.id, userId, userId, auth.user.id).first();
+
+    if (blocked) {
+        return fail('You cannot invite this account while either account has the other blocked.', 403);
+    }
+
+    const low = auth.user.id < userId ? auth.user.id : userId;
+    const high = auth.user.id < userId ? userId : auth.user.id;
+
+    const friendship = await env.DB.prepare(
+        `SELECT id
+         FROM direct_conversations
+         WHERE user_low_id = ?
+           AND user_high_id = ?
+           AND status = 'accepted'
+         LIMIT 1`
+    ).bind(low, high).first();
+
+    if (!friendship) {
+        return fail('You can only invite an accepted friend to a group DM.', 403);
+    }
+
+    const memberCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM direct_group_members WHERE group_id=?').bind(groupId).first();
+    if (Number(memberCount?.n ?? 0) >= 20) return fail('This group DM is full (20 members).',400);
+    const now = Date.now();
+
+    await env.DB.prepare(
+        `INSERT INTO direct_group_members (group_id, user_id, joined_at, added_by)
+         SELECT ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM direct_group_members WHERE group_id = ?) < 20
+         ON CONFLICT(group_id, user_id) DO NOTHING`
+    ).bind(groupId, userId, now, auth.user.id, groupId).run();
+
+    await env.DB.prepare(
+        `UPDATE direct_groups SET updated_at = ? WHERE id = ?`
+    ).bind(now, groupId).run();
+
+    const updated = await env.DB.prepare(
+        `SELECT * FROM direct_groups WHERE id = ? LIMIT 1`
+    ).bind(groupId).first();
+
+    return json(await directGroupPayload(env, updated, auth.user.id));
+}
+
+
 async function getDirectCenter(request, env) {
     const auth = await requireUser(request, env);
     if ('response' in auth) return auth.response;
@@ -3954,6 +4090,7 @@ async function getDirectCenter(request, env) {
       ORDER BY updated_at DESC LIMIT 200`).bind(auth.user.id, auth.user.id).all();
 
     const conversations = [];
+    const friends = [];
     const incomingRequests = [];
     const outgoingRequests = [];
 
@@ -3961,6 +4098,8 @@ async function getDirectCenter(request, env) {
         const item = await directConversationPayload(env, row, auth.user.id);
         if (!item) continue;
         if (item.status === 'accepted') {
+            // Friendship exists even when its DM thread is closed.
+            friends.push(item);
             if (directThreadVisible(item, item.lastMessageAt)) conversations.push(item);
         } else if (item.status === 'pending' && item.requestedByMe) {
             outgoingRequests.push(item);
@@ -3998,7 +4137,7 @@ async function getDirectCenter(request, env) {
 
             supportThread = {
                 id: 'support',
-                title: 'Support Replys',
+                title: 'Support Tickets',
                 lastMessage: supportLast.body ?? supportLast.subject ?? 'Support message',
                 lastMessageAt: Number(supportLast.created_at ?? 0),
                 unreadCount: Number(unread?.count ?? 0),
@@ -4008,6 +4147,7 @@ async function getDirectCenter(request, env) {
     }
 
     return json({
+        friends,
         conversations,
         incomingRequests,
         outgoingRequests,
@@ -4197,6 +4337,7 @@ async function listDirectConversationMessages(request, env, conversationId) {
     const row = await directConversationForUser(env, conversationId, auth.user.id);
     if (!row) return fail('Direct conversation not found.', 404);
     if (row.status !== 'accepted') return fail('Accept the message request before opening the conversation.', 403);
+    await upsertNotificationReadCursorV72(env, auth.user.id, 'dm', conversationId, Date.now());
     const result = await env.DB.prepare(`SELECT m.id, m.conversation_id, m.sender_user_id, m.body, m.created_at, u.display_name AS sender_name
       FROM direct_messages m JOIN users u ON u.id = m.sender_user_id
       WHERE m.conversation_id = ? ORDER BY m.created_at ASC LIMIT 500`)
@@ -4214,6 +4355,8 @@ async function listDirectConversationMessages(request, env, conversationId) {
 async function sendDirectConversationMessage(request, env, conversationId) {
     const auth = await requireUser(request, env);
     if ('response' in auth) return auth.response;
+    const v77DirectRestriction = auth.user.platform_role === 'creator' ? null : (await activeSupportRestrictionV77(env, 'user', auth.user.id, 'direct_messages') || await activeSupportRestrictionV77(env, 'user', auth.user.id, 'send_messages'));
+    if (v77DirectRestriction) return fail('Your account is currently view-only for direct messages.', 403);
     await enforceRateLimit(request, env, 'direct-message', 300, 1000 * 60 * 60, auth.user.id);
     const row = await directConversationForUser(env, conversationId, auth.user.id);
     if (!row) return fail('Direct conversation not found.', 404);
@@ -4387,7 +4530,7 @@ async function getPublicProfile(username, env) {
     }
     return json({
         ...publicProfile(user),
-        presence: publicVisiblePresence(user.presence_status),
+        presence: publicVisiblePresence(user.presence_status, user.updated_at),
     });
 }
 
@@ -4398,13 +4541,27 @@ function normalizePresencePreference(value) {
         : 'online';
 }
 
-function publicVisiblePresence(value) {
+// SPACES_PRESENCE_TTL_V65
+const PRESENCE_HEARTBEAT_TTL_MS = 70_000;
+
+function publicVisiblePresence(value, lastSeenAt = null) {
     const normalized = normalizePresencePreference(value);
-    return normalized === 'invisible' ? 'offline' : normalized;
+    if (normalized === 'invisible') return 'offline';
+
+    // A status preference is not proof that an app/device is still connected.
+    // Only enforce liveness when the caller supplies the user's last heartbeat.
+    if (lastSeenAt !== null && lastSeenAt !== undefined) {
+        const seenAt = Number(lastSeenAt);
+        if (!Number.isFinite(seenAt) || seenAt <= 0 || Date.now() - seenAt > PRESENCE_HEARTBEAT_TTL_MS) {
+            return 'offline';
+        }
+    }
+
+    return normalized;
 }
 
-function memberPresence(value) {
-    const visible = publicVisiblePresence(value);
+function memberPresence(value, lastSeenAt) {
+    const visible = publicVisiblePresence(value, lastSeenAt);
     return visible === 'idle' ? 'away' : visible;
 }
 
@@ -4458,7 +4615,7 @@ async function listBlockedUsers(request, env) {
 
     return json((result.results ?? []).map(user => ({
         ...publicProfile(user),
-        presence: publicVisiblePresence(user.presence_status),
+        presence: publicVisiblePresence(user.presence_status, user.updated_at),
     })));
 }
 
@@ -4527,6 +4684,153 @@ function mentionTokenPresent(body, token) {
     return false;
 }
 
+
+async function notificationReadCursorMapV72(env, userId) {
+  const result = await env.DB.prepare(
+    `SELECT scope_kind, scope_id, read_at
+     FROM notification_read_cursors
+     WHERE user_id = ?`
+  ).bind(userId).all();
+  const map = new Map();
+  for (const row of result.results ?? []) {
+    map.set(`${row.scope_kind}:${row.scope_id}`, Number(row.read_at ?? 0));
+  }
+  return map;
+}
+
+function notificationReadAtV72(map, kind, id) {
+  return Number(map.get(`${kind}:${id}`) ?? 0);
+}
+
+async function upsertNotificationReadCursorV72(env, userId, scopeKind, scopeId, readAt = Date.now()) {
+  await env.DB.prepare(
+    `INSERT INTO notification_read_cursors (user_id, scope_kind, scope_id, read_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, scope_kind, scope_id) DO UPDATE SET
+       read_at = MAX(notification_read_cursors.read_at, excluded.read_at)`
+  ).bind(userId, scopeKind, scopeId, readAt).run();
+}
+
+async function notificationScopeAccessV72(request, env, scopeKind, scopeId, { typing = false } = {}) {
+  const auth = await requireUser(request, env);
+  if ('response' in auth) return auth;
+
+  if (scopeKind === 'all') return { auth };
+
+  if (scopeKind === 'channel') {
+    const channel = await env.DB.prepare(
+      `SELECT id, space_id, post_min_role, kind
+       FROM channels WHERE id = ? LIMIT 1`
+    ).bind(scopeId).first();
+    if (!channel) return { response: fail('Channel not found.', 404) };
+    const access = await workspaceAccessForUser(env, auth.user.id, channel.space_id);
+    if (!access) return { response: fail('You are not a member of that Space.', 403) };
+    const rowsResult = await env.DB.prepare(
+      `SELECT * FROM channel_permission_overwrites WHERE space_id = ? AND channel_id = ?`
+    ).bind(channel.space_id, channel.id).all();
+    const rows = rowsResult.results ?? [];
+    if (channelPermissionDecision(access, rows, 'view_channel') === 'deny') {
+      return { response: fail('You cannot view that channel.', 403) };
+    }
+    if (typing) {
+      const postRequired = normalizeChannelPermission(channel.post_min_role, channel.kind === 'announcement' ? 'admin' : 'contributor');
+      const baseSend = postRequired !== 'disabled' &&
+        (roleMeetsPermission(access.role, postRequired) || accessHas(access, 'send_messages'));
+      if (!channelPermissionAllowed(access, rows, 'send_messages', baseSend)) {
+        return { response: fail('You cannot send messages in that channel.', 403) };
+      }
+    }
+    return { auth, access, workspaceId: channel.space_id };
+  }
+
+  if (scopeKind === 'dm') {
+    const row = await directConversationForUser(env, scopeId, auth.user.id);
+    if (!row || row.status !== 'accepted') return { response: fail('Direct conversation not found.', 404) };
+    return { auth };
+  }
+
+  if (scopeKind === 'group') {
+    const row = await directGroupForUser(env, scopeId, auth.user.id);
+    if (!row) return { response: fail('Group chat not found.', 404) };
+    return { auth };
+  }
+
+  if (scopeKind === 'support') {
+    if (scopeId !== 'support') return { response: fail('Support conversation not found.', 404) };
+    return { auth };
+  }
+
+  if (scopeKind === 'friend_request') {
+    if (scopeId !== 'requests') return { response: fail('Friend request scope not found.', 404) };
+    return { auth };
+  }
+
+  return { response: fail('Unknown notification scope.', 400) };
+}
+
+async function markNotificationReadV72(request, env) {
+  const body = await readJson(request);
+  const scopeKind = String(body.scopeKind ?? '').trim();
+  const scopeId = String(body.scopeId ?? '').trim();
+  if (!scopeKind || !scopeId) return fail('Notification scope is required.', 400);
+  const access = await notificationScopeAccessV72(request, env, scopeKind, scopeId);
+  if ('response' in access) return access.response;
+  const readAtInput = Number(body.readAt ?? Date.now());
+  const readAt = Number.isFinite(readAtInput) ? Math.min(readAtInput, Date.now() + 60_000) : Date.now();
+  await upsertNotificationReadCursorV72(env, access.auth.user.id, scopeKind, scopeId, readAt);
+  if (scopeKind === 'support') {
+    await env.DB.prepare(
+      `UPDATE support_messages
+       SET read_at = COALESCE(read_at, ?)
+       WHERE recipient_user_id = ? AND read_at IS NULL AND created_at <= ?`
+    ).bind(readAt, access.auth.user.id, readAt).run();
+  }
+  return json({ scopeKind, scopeId, readAt });
+}
+
+async function typingPresenceV72(request, env, scopeKind, scopeId) {
+  if (!['channel', 'dm', 'group', 'support'].includes(scopeKind)) {
+    return fail('Unknown typing scope.', 400);
+  }
+  const access = await notificationScopeAccessV72(request, env, scopeKind, scopeId, { typing: true });
+  if ('response' in access) return access.response;
+  const now = Date.now();
+
+  if (request.method === 'GET') {
+    const result = await env.DB.prepare(
+      `SELECT tp.user_id, tp.updated_at, u.display_name
+       FROM typing_presence tp
+       JOIN users u ON u.id = tp.user_id
+       WHERE tp.scope_kind = ?
+         AND tp.scope_id = ?
+         AND tp.user_id <> ?
+         AND tp.updated_at > ?
+       ORDER BY tp.updated_at DESC
+       LIMIT 12`
+    ).bind(scopeKind, scopeId, access.auth.user.id, now - 5500).all();
+    return json((result.results ?? []).map(row => ({
+      userId: row.user_id,
+      displayName: row.display_name || 'Someone',
+      updatedAt: Number(row.updated_at ?? 0),
+    })));
+  }
+
+  if (request.method === 'DELETE') {
+    await env.DB.prepare(
+      `DELETE FROM typing_presence WHERE user_id = ? AND scope_kind = ? AND scope_id = ?`
+    ).bind(access.auth.user.id, scopeKind, scopeId).run();
+    return new Response(null, { status: 204, headers: corsHeaders() });
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO typing_presence (user_id, scope_kind, scope_id, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, scope_kind, scope_id) DO UPDATE SET updated_at = excluded.updated_at`
+  ).bind(access.auth.user.id, scopeKind, scopeId, now).run();
+  await env.DB.prepare(`DELETE FROM typing_presence WHERE updated_at < ?`).bind(now - 30_000).run();
+  return json({ ok: true, updatedAt: now });
+}
+
 async function listNotifications(request, env) {
     const auth = await requireUser(request, env);
     if ('response' in auth) return auth.response;
@@ -4538,6 +4842,9 @@ async function listNotifications(request, env) {
         Number.isFinite(requestedSince) ? requestedSince : 0,
         Date.now() - 7 * 24 * 60 * 60 * 1000,
     );
+
+    const readCursorsV72 = await notificationReadCursorMapV72(env, auth.user.id);
+    const globalReadV72 = notificationReadAtV72(readCursorsV72, 'all', 'all');
 
     const roleRows = await env.DB.prepare(
         `SELECT sm.space_id, r.name
@@ -4616,6 +4923,7 @@ async function listNotifications(request, env) {
     const overwritesBySpace = new Map();
 
     for (const row of result.results ?? []) {
+        if (Number(row.created_at ?? 0) <= Math.max(globalReadV72, notificationReadAtV72(readCursorsV72, 'channel', row.channel_id))) continue;
         if (blockedUserIds.has(String(row.author_id))) continue;
         if (!accessBySpace.has(row.space_id)) {
             const access = await workspaceAccessForUser(env, auth.user.id, row.space_id);
@@ -4682,10 +4990,11 @@ async function listNotifications(request, env) {
             `SELECT m.id, m.subject, m.body, m.message_kind, m.created_at, sender.display_name AS sender_name
              FROM support_messages m
              JOIN users sender ON sender.id = m.sender_user_id
-             WHERE m.recipient_user_id = ? AND m.created_at > ?
+             WHERE m.recipient_user_id = ? AND m.created_at > ? AND m.ticket_id IS NULL
              ORDER BY m.created_at DESC LIMIT 80`
         ).bind(auth.user.id, since).all();
         for (const row of supportRows.results ?? []) {
+            if (Number(row.created_at ?? 0) <= Math.max(globalReadV72, notificationReadAtV72(readCursorsV72, 'support', 'support'))) continue;
             if (mutedThreadKeys.has('support:support')) continue;
             items.push({
                 id: `support-${row.id}`,
@@ -4718,6 +5027,7 @@ async function listNotifications(request, env) {
            ORDER BY dm.created_at DESC LIMIT 100`)
             .bind(auth.user.id, auth.user.id, auth.user.id, since).all();
         for (const row of directRows.results ?? []) {
+            if (Number(row.created_at ?? 0) <= Math.max(globalReadV72, notificationReadAtV72(readCursorsV72, 'dm', row.conversation_id))) continue;
             if (blockedUserIds.has(String(row.sender_user_id))) continue;
             if (mutedThreadKeys.has(`dm:${row.conversation_id}`)) continue;
             items.push({
@@ -4746,6 +5056,7 @@ async function listNotifications(request, env) {
            ORDER BY gm.created_at DESC LIMIT 100`)
             .bind(auth.user.id, auth.user.id, since).all();
         for (const row of groupRows.results ?? []) {
+            if (Number(row.created_at ?? 0) <= Math.max(globalReadV72, notificationReadAtV72(readCursorsV72, 'group', row.group_id))) continue;
             if (blockedUserIds.has(String(row.sender_user_id))) continue;
             if (mutedThreadKeys.has(`group:${row.group_id}`)) continue;
             items.push({
@@ -4774,6 +5085,7 @@ async function listNotifications(request, env) {
            ORDER BY dc.updated_at DESC LIMIT 50`)
             .bind(auth.user.id, auth.user.id, auth.user.id, since).all();
         for (const row of requestRows.results ?? []) {
+            if (Number(row.updated_at ?? 0) <= Math.max(globalReadV72, notificationReadAtV72(readCursorsV72, 'friend_request', 'requests'))) continue;
             if (blockedUserIds.has(String(row.requester_id))) continue;
             items.push({
                 id: `friend-request-${row.id}`,
@@ -4793,6 +5105,148 @@ async function listNotifications(request, env) {
         console.warn('Direct/friend notifications unavailable.', caught);
     }
 
+    try {
+        const commentRows = await env.DB.prepare(`SELECT
+             c.id, c.space_id, c.note_id, c.author_id, c.body, c.created_at,
+             n.title AS note_title, n.channel_id, n.created_by,
+             sp.name AS workspace_name, ch.name AS channel_name,
+             u.display_name AS author_name
+           FROM note_comments c
+           JOIN notes n ON n.id = c.note_id
+           JOIN spaces sp ON sp.id = c.space_id
+           JOIN channels ch ON ch.id = n.channel_id AND ch.space_id = c.space_id
+           JOIN users u ON u.id = c.author_id
+           JOIN space_members mine ON mine.space_id = c.space_id AND mine.user_id = ?
+           WHERE c.author_id <> ?
+             AND c.created_at > ?
+             AND c.deleted_at IS NULL
+             AND (
+               n.created_by = ?
+               OR EXISTS (
+                 SELECT 1 FROM note_comments mine_comment
+                 WHERE mine_comment.note_id = c.note_id
+                   AND mine_comment.author_id = ?
+                   AND mine_comment.created_at < c.created_at
+               )
+             )
+           ORDER BY c.created_at DESC LIMIT 80`)
+          .bind(auth.user.id, auth.user.id, since, auth.user.id, auth.user.id).all();
+
+        for (const row of commentRows.results ?? []) {
+            if (Number(row.created_at ?? 0) <= Math.max(globalReadV72, notificationReadAtV72(readCursorsV72, 'channel', row.channel_id))) continue;
+            const access = await workspaceAccessForUser(env, auth.user.id, row.space_id);
+            if (!access) continue;
+            const overwriteRows = await env.DB.prepare(
+              `SELECT * FROM channel_permission_overwrites WHERE space_id = ? AND channel_id = ?`
+            ).bind(row.space_id, row.channel_id).all();
+            if (channelPermissionDecision(access, overwriteRows.results ?? [], 'view_channel') === 'deny') continue;
+            items.push({
+                id: `comment-${row.id}`,
+                workspaceId: row.space_id,
+                workspaceName: row.workspace_name,
+                channelId: row.channel_id,
+                channelName: row.channel_name,
+                authorName: row.author_name || 'Member',
+                preview: String(row.body ?? '').slice(0, 180),
+                createdAt: Number(row.created_at ?? 0),
+                kind: 'comment',
+                mentionLabel: 'New comment on note',
+                noteTitle: row.note_title || 'note',
+            });
+        }
+    } catch (caught) {
+        console.warn('Note comment notifications unavailable.', caught);
+    }
+
+
+    try {
+        if (isSupportTeamUserV73(auth.user)) {
+            const ticketRows = await env.DB.prepare(`SELECT
+                m.id,
+                m.body,
+                m.created_at,
+                t.ticket_number,
+                t.topic,
+                owner.display_name AS owner_name
+              FROM support_messages m
+              JOIN support_tickets t ON t.id = m.ticket_id
+              JOIN users owner ON owner.id = t.user_id
+              WHERE m.ticket_id IS NOT NULL
+                AND m.sender_user_id = t.user_id
+                AND (
+                  t.status = 'waiting'
+                  OR t.assigned_to = ?
+                  OR EXISTS (
+                    SELECT 1
+                    FROM support_ticket_collaborators c
+                    WHERE c.ticket_id = t.id AND c.user_id = ?
+                  )
+                )
+                AND m.created_at > ?
+              ORDER BY m.created_at DESC
+              LIMIT 80`)
+              .bind(auth.user.id, auth.user.id, since)
+              .all();
+
+            for (const row of ticketRows.results ?? []) {
+                items.push({
+                    id: `support-ticket-staff-${row.id}`,
+                    workspaceId: SPACES_HUB_ID,
+                    workspaceName: 'Spaces Support',
+                    channelId: 'spaces-hub-updates',
+                    channelName: 'Support Ticket',
+                    authorName: row.owner_name || 'Spaces member',
+                    preview: `${row.ticket_number} · ${row.topic}: ${row.body}`.slice(0, 180),
+                    createdAt: Number(row.created_at ?? 0),
+                    kind: 'support',
+                    mentionLabel: 'Support ticket',
+                    supportTicketNumber: row.ticket_number,
+                    supportTicketStaff: true,
+                });
+            }
+        } else {
+            const ticketRows = await env.DB.prepare(`SELECT
+                m.id,
+                m.body,
+                m.created_at,
+                t.ticket_number,
+                t.topic,
+                sender.display_name AS sender_name
+              FROM support_messages m
+              JOIN support_tickets t ON t.id = m.ticket_id
+              JOIN users sender ON sender.id = m.sender_user_id
+              WHERE m.ticket_id IS NOT NULL
+                AND m.recipient_user_id = ?
+                AND m.created_at > ?
+              ORDER BY m.created_at DESC
+              LIMIT 80`)
+              .bind(auth.user.id, since)
+              .all();
+
+            for (const row of ticketRows.results ?? []) {
+                items.push({
+                    id: `support-ticket-user-${row.id}`,
+                    workspaceId: SPACES_HUB_ID,
+                    workspaceName: 'Spaces Support',
+                    channelId: 'spaces-hub-updates',
+                    channelName: 'Support Ticket',
+                    authorName: row.sender_name || 'Spaces Support',
+                    preview: `${row.ticket_number} · ${row.topic}: ${row.body}`.slice(0, 180),
+                    createdAt: Number(row.created_at ?? 0),
+                    kind: 'support',
+                    mentionLabel: 'Support reply',
+                    supportTicketNumber: row.ticket_number,
+                    supportTicketStaff: false,
+                });
+            }
+        }
+    } catch (caught) {
+        console.warn('Support ticket notifications unavailable.', caught);
+    }
+
+    try {
+      items.push(...await missedDmNotificationsV85(env, auth.user.id, since, readCursorsV72, globalReadV72, mutedThreadKeys, blockedUserIds));
+    } catch (error) { console.warn('Missed-call notices unavailable',error); }
     return json(items.sort((a, b) => b.createdAt - a.createdAt));
 }
 
@@ -5040,6 +5494,9 @@ async function createWorkspace(
     if ('response' in auth) {
         return auth.response;
     }
+
+    const v77CreateSpacesRestriction = auth.user.platform_role === 'creator' ? null : await activeSupportRestrictionV77(env, 'user', auth.user.id, 'create_spaces');
+    if (v77CreateSpacesRestriction) return fail('Your account is restricted from creating Spaces.', 403);
 
     // v48 restriction enforcement: space_create
     if (auth.user.platform_role !== 'creator') {
@@ -5695,6 +6152,9 @@ async function joinWorkspaceInvite(
         return auth.response;
     }
 
+    const v77JoinSpacesRestriction = auth.user.platform_role === 'creator' ? null : await activeSupportRestrictionV77(env, 'user', auth.user.id, 'join_spaces');
+    if (v77JoinSpacesRestriction) return fail('Your account is restricted from joining Spaces.', 403);
+
     // v48 restriction enforcement: space_join
     if (auth.user.platform_role !== 'creator') {
         const restriction = await activePlatformRestrictionV48(env, auth.user.id, 'space_join');
@@ -5777,6 +6237,9 @@ async function joinWorkspaceInvite(
             404,
         );
     }
+
+    const v77SpaceJoinRestriction = await activeSupportRestrictionV77(env, 'space', invite.space_id, 'join_space');
+    if (v77SpaceJoinRestriction) return fail('This Space is temporarily restricted from accepting new joins.', 403);
 
     const existing =
         await env.DB.prepare(
@@ -7506,6 +7969,10 @@ async function sendWorkspaceMessage(
     const access = await requireWorkspaceMembership(request, env, workspaceId);
     if ('response' in access) return access.response;
 
+    const v77UserMessageRestriction = access.user.platform_role === 'creator' ? null : await activeSupportRestrictionV77(env, 'user', access.user.id, 'send_messages');
+    const v77SpaceMessageRestriction = await activeSupportRestrictionV77(env, 'space', workspaceId, 'send_messages');
+    if (v77UserMessageRestriction || v77SpaceMessageRestriction) return fail('Messaging is restricted here. You can still view accessible content.', 403);
+
     // v48 restriction enforcement: chat
     if (access.user.platform_role !== 'creator') {
         const restriction = await activePlatformRestrictionV48(env, access.user.id, 'chat');
@@ -7525,6 +7992,8 @@ async function sendWorkspaceMessage(
     ).bind(channelId, workspaceId).first();
 
     if (!channel) return fail('Channel not found.', 404);
+    const v77ChannelMessageRestriction = await activeSupportRestrictionV77(env, 'channel', channelId, 'send_messages');
+    if (v77ChannelMessageRestriction) return fail('This channel is temporarily locked by Spaces Support.', 403);
 
     const requiredRole = normalizeChannelPermission(
         channel.post_min_role,
@@ -7546,7 +8015,13 @@ async function sendWorkspaceMessage(
 
     const body = await readJson(request);
     const messageBody = String(body.body ?? '').trim();
+    const replyToMessageId = String(body.replyToMessageId ?? '').trim() || null;
+    if (replyToMessageId) {
+        const replyTarget = await env.DB.prepare('SELECT id FROM messages WHERE id = ? AND space_id = ? AND channel_id = ? LIMIT 1').bind(replyToMessageId, workspaceId, channelId).first();
+        if (!replyTarget) return fail('Reply target not found in this channel.', 404);
+    }
     const attachment = parseChatAttachment(body.attachment);
+    if (attachment && access.user.platform_role !== 'creator' && await activeSupportRestrictionV77(env, 'user', access.user.id, 'uploads')) return fail('Your account is restricted from uploading files or media.', 403);
     if (attachment) {
         const attachDecision = channelPermissionDecision(access, permissionRows, 'attach_files');
         const baseCanAttach = accessHas(access, 'attach_files');
@@ -7564,14 +8039,15 @@ async function sendWorkspaceMessage(
     await env.DB.prepare(
         `INSERT INTO messages
           (id, space_id, channel_id, author_id, body, created_at, edited_at,
-           deleted_at, deleted_by, attachment_name, attachment_type, attachment_size, attachment_data)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)`
+           deleted_at, deleted_by, attachment_name, attachment_type, attachment_size, attachment_data, reply_to_message_id)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)`
     ).bind(
         id, workspaceId, channelId, access.user.id, messageBody, now,
         attachment?.name ?? null,
         attachment?.type ?? null,
         attachment?.size ?? null,
         attachment?.dataUrl ?? null,
+        replyToMessageId,
     ).run();
 
     return json({
@@ -7586,6 +8062,7 @@ async function sendWorkspaceMessage(
         editedAt: null,
         deletedAt: null,
         deletedBy: null,
+        replyToMessageId,
         attachment: attachment ? {
             name: attachment.name, type: attachment.type, size: attachment.size,
             downloadPath: `/v1/workspaces/${encodeURIComponent(workspaceId)}/messages/${encodeURIComponent(id)}/attachment`,
@@ -8095,13 +8572,19 @@ async function createNoteComment(request, env, workspaceId, noteId) {
     if (!note) return fail('Post not found.', 404);
     const body = await readJson(request);
     const commentBody = String(body.body ?? '').trim();
+    let parentCommentId = String(body.parentCommentId ?? '').trim() || null;
+    if (parentCommentId) {
+        const parent = await env.DB.prepare('SELECT id, parent_comment_id FROM note_comments WHERE id = ? AND space_id = ? AND note_id = ? LIMIT 1').bind(parentCommentId, workspaceId, noteId).first();
+        if (!parent) return fail('Reply target not found for this note.', 404);
+        parentCommentId = parent.parent_comment_id || parent.id;
+    }
     if (!commentBody || commentBody.length > 1000) return fail('Comment must be 1-1000 characters.');
     const id = crypto.randomUUID();
     const now = Date.now();
     await env.DB.prepare(
-        `INSERT INTO note_comments (id, space_id, note_id, author_id, body, created_at, edited_at, deleted_at, deleted_by)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`
-    ).bind(id, workspaceId, noteId, access.user.id, commentBody, now).run();
+        `INSERT INTO note_comments (id, space_id, note_id, author_id, body, created_at, edited_at, deleted_at, deleted_by, parent_comment_id)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)`
+    ).bind(id, workspaceId, noteId, access.user.id, commentBody, now, parentCommentId).run();
     await env.DB.prepare(
         `INSERT INTO audit_logs
           (id, space_id, actor_id, action, target_type, target_id, target_label, reason, metadata_json, created_at)
@@ -8109,7 +8592,7 @@ async function createNoteComment(request, env, workspaceId, noteId) {
     ).bind(crypto.randomUUID(), workspaceId, access.user.id, id, note.title, JSON.stringify({ noteId }), now).run();
     return json({ id, workspaceId, noteId, authorId: access.user.id,
         authorName: access.user.display_name, authorInitials: String(access.user.display_name || access.user.username || 'M').slice(0,1).toUpperCase(),
-        authorAvatarUrl: access.user.avatar_url ?? null, body: commentBody, createdAt: now, editedAt: null, deletedAt: null, deletedBy: null }, 201);
+        authorAvatarUrl: access.user.avatar_url ?? null, authorUsername: access.user.username ?? '', body: commentBody, createdAt: now, editedAt: null, deletedAt: null, deletedBy: null, parentCommentId }, 201);
 }
 
 async function editNoteComment(request, env, workspaceId, commentId) {
@@ -8134,7 +8617,7 @@ async function editNoteComment(request, env, workspaceId, commentId) {
     ).bind(crypto.randomUUID(), workspaceId, access.user.id, commentId, comment.note_title, JSON.stringify({ noteId: comment.note_id }), now).run();
     return json({ id: comment.id, workspaceId, noteId: comment.note_id, authorId: comment.author_id,
         authorName: access.user.display_name, authorInitials: String(access.user.display_name || access.user.username || 'M').slice(0,1).toUpperCase(),
-        authorAvatarUrl: access.user.avatar_url ?? null, body: commentBody, createdAt: comment.created_at, editedAt: now, deletedAt: null, deletedBy: null });
+        authorAvatarUrl: access.user.avatar_url ?? null, authorUsername: access.user.username ?? '', body: commentBody, createdAt: comment.created_at, editedAt: now, deletedAt: null, deletedBy: null, parentCommentId: comment.parent_comment_id ?? null });
 }
 
 async function deleteNoteComment(request, env, workspaceId, commentId) {
@@ -9919,7 +10402,7 @@ async function applySupportRestrictionV48(request, env, userId) {
 
     await supportAuditV48(
         env, support.user.id, userId, `restriction.${kind}`, reason,
-        { restrictionId: id, expiresAt },
+        { restrictionId: id, expiresAt, actorRole: support.user.platform_role ?? null, targetRole: target.platform_role ?? null, restrictionType: kind, durationMinutes: durationMinutes ?? null, appliedAt: now },
     );
     return json({ id, userId, kind, reason, createdAt: now, expiresAt, active: true }, 201);
 }
@@ -9989,6 +10472,535 @@ async function revokeSupportRestrictionV48(request, env, source, restrictionId) 
     return new Response(null, { status: 204, headers: corsHeaders() });
 }
 
+// ---- Spaces V77 Support Operations -------------------------------------------------
+const SUPPORT_V77_CASE_TYPES = ['request','user_report','space_report','bug_report','appeal','other'];
+const SUPPORT_V77_STATUSES = ['waiting','reviewing','resolved','archived'];
+const SUPPORT_V77_PRIORITIES = ['low','normal','high','urgent'];
+const SUPPORT_V77_USER_CAPABILITIES = ['platform_access','send_messages','direct_messages','uploads','create_spaces','join_spaces'];
+const SUPPORT_V77_SPACE_CAPABILITIES = ['send_messages','join_space'];
+const SUPPORT_V77_CHANNEL_CAPABILITIES = ['send_messages'];
+
+function supportV77Json(value, fallback = {}) {
+    try { return value ? JSON.parse(value) : fallback; }
+    catch { return fallback; }
+}
+
+function supportV77IsTeam(user) {
+    return ['creator','staff','support'].includes(user?.platform_role);
+}
+
+function supportV77ClientRole(value) {
+    return value === 'creator' ? 'founder' : (['staff','support'].includes(value) ? value : null);
+}
+
+function supportV77CaseNumber() {
+    return `SP-${Date.now().toString(36).toUpperCase()}-${crypto.randomUUID().slice(0, 4).toUpperCase()}`;
+}
+
+function supportV77MapLegacyStatus(value, archivedAt = null) {
+    if (archivedAt) return 'archived';
+    if (value === 'waiting' || value === 'open') return 'waiting';
+    if (value === 'reviewing' || value === 'reviewed' || value === 'actioned') return 'reviewing';
+    if (value === 'resolved' || value === 'dismissed' || value === 'closed') return 'resolved';
+    return 'waiting';
+}
+
+async function supportV77Audit(env, actor, action, targetType, targetId, caseId = null, reasonCategory = '', note = '', before = {}, after = {}, expiresAt = null) {
+    await env.DB.prepare(`INSERT INTO support_audit_v77
+      (id, actor_id, actor_role, action, target_type, target_id, case_id, reason_category, note, before_json, after_json, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(crypto.randomUUID(), actor.id, actor.platform_role ?? null, action, targetType, targetId, caseId, String(reasonCategory ?? '').slice(0,120), String(note ?? '').slice(0,1200), JSON.stringify(before ?? {}), JSON.stringify(after ?? {}), expiresAt, Date.now()).run();
+}
+
+async function activeSupportRestrictionV77(env, targetType, targetId, capability) {
+    const now = Date.now();
+    return env.DB.prepare(`SELECT * FROM support_restrictions_v77
+      WHERE target_type = ? AND target_id = ? AND capability = ? AND active = 1
+        AND (expires_at IS NULL OR expires_at > ?)
+      ORDER BY created_at DESC LIMIT 1`).bind(targetType, targetId, capability, now).first();
+}
+
+async function supportV77SyncLegacy(env) {
+    // V73/V75 ticket compatibility. Every operation is best-effort so an older
+    // installation without one of these tables is still valid.
+    try {
+        const result = await env.DB.prepare(`SELECT * FROM support_tickets ORDER BY last_activity_at DESC LIMIT 500`).all();
+        for (const row of result.results ?? []) {
+            const id = `legacy-ticket:${row.id}`;
+            const status = supportV77MapLegacyStatus(row.status, null);
+            await env.DB.prepare(`INSERT OR IGNORE INTO support_cases_v77
+              (id,case_number,case_type,subtype,reporter_id,target_user_id,target_space_id,target_channel_id,subject,answers_json,details,priority,status,assigned_to,source,created_at,updated_at,last_activity_at,resolved_at,resolved_by,archived_at,archived_by)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+              .bind(id, row.ticket_number || `SP-${String(row.id).slice(0,8)}`, 'request', String(row.topic ?? 'Legacy Support Ticket'), row.user_id, null, null, null, String(row.topic ?? `Support Ticket ${row.ticket_number ?? ''}`), '{}', '', 'normal', status, row.assigned_to ?? null, 'legacy_ticket', Number(row.created_at ?? Date.now()), Number(row.updated_at ?? row.created_at ?? Date.now()), Number(row.last_activity_at ?? row.updated_at ?? row.created_at ?? Date.now()), row.resolved_at ? Number(row.resolved_at) : null, row.resolved_by ?? null, null, null).run();
+            // SPACES_V77_6_ARCHIVE_TITLEBAR_ROLES: once a case has any native V77 activity, V77 becomes
+            // authoritative for lifecycle state. Older ticket rows may continue to feed
+            // messages/events, but they must never pull Archived/Reviewing back to a
+            // stale legacy status on the next queue refresh.
+            const v776NativeActivity = await env.DB.prepare(`SELECT id FROM support_case_events_v77 WHERE case_id = ? AND id NOT LIKE 'legacy-%' LIMIT 1`).bind(id).first();
+            if (!v776NativeActivity) {
+                await env.DB.prepare(`UPDATE support_cases_v77 SET status = ?, assigned_to = ?, updated_at = ?, last_activity_at = ?, resolved_at = ?, resolved_by = ? WHERE id = ? AND source = 'legacy_ticket'`)
+                  .bind(status, row.assigned_to ?? null, Number(row.updated_at ?? row.created_at ?? Date.now()), Number(row.last_activity_at ?? row.updated_at ?? row.created_at ?? Date.now()), row.resolved_at ? Number(row.resolved_at) : null, row.resolved_by ?? null, id).run();
+            } else {
+                // Repair cases that were already reverted by V77.5 before this hotfix.
+                // The screenshot case has a native archive event but its row was pulled
+                // back to resolved by the legacy sync; this restores that event as truth.
+                const v776LatestArchive = await env.DB.prepare(`SELECT actor_user_id, created_at FROM support_case_events_v77 e WHERE e.case_id = ? AND e.id NOT LIKE 'legacy-%' AND e.event_type = 'archive' AND NOT EXISTS (SELECT 1 FROM support_case_events_v77 later WHERE later.case_id = e.case_id AND later.id NOT LIKE 'legacy-%' AND later.created_at > e.created_at AND later.event_type IN ('reopen','reviewing','take','release','resolve','archive')) ORDER BY e.created_at DESC LIMIT 1`).bind(id).first();
+                if (v776LatestArchive) {
+                    await env.DB.prepare(`UPDATE support_cases_v77 SET status='archived', archived_at=COALESCE(archived_at,?), archived_by=COALESCE(archived_by,?), updated_at=MAX(updated_at,?), last_activity_at=MAX(last_activity_at,?) WHERE id=? AND source='legacy_ticket'`)
+                      .bind(Number(v776LatestArchive.created_at), v776LatestArchive.actor_user_id ?? null, Number(v776LatestArchive.created_at), Number(v776LatestArchive.created_at), id).run();
+                }
+            }
+        }
+        try {
+            const events = await env.DB.prepare(`SELECT * FROM support_ticket_events ORDER BY created_at ASC LIMIT 4000`).all();
+            for (const event of events.results ?? []) {
+                await env.DB.prepare(`INSERT OR IGNORE INTO support_case_events_v77 (id,case_id,actor_user_id,event_type,body,metadata_json,created_at) VALUES (?,?,?,?,?,?,?)`)
+                  .bind(`legacy-ticket-event:${event.id}`, `legacy-ticket:${event.ticket_id}`, event.actor_user_id ?? null, String(event.event_type ?? 'legacy_event'), '', String(event.metadata_json ?? '{}'), Number(event.created_at ?? Date.now())).run();
+            }
+        } catch { /* optional legacy event table */ }
+        try {
+            const messages = await env.DB.prepare(`SELECT id,ticket_id,sender_user_id,body,created_at FROM support_messages WHERE ticket_id IS NOT NULL ORDER BY created_at ASC LIMIT 4000`).all();
+            for (const message of messages.results ?? []) {
+                await env.DB.prepare(`INSERT OR IGNORE INTO support_case_events_v77 (id,case_id,actor_user_id,event_type,body,metadata_json,created_at) VALUES (?,?,?,?,?,?,?)`)
+                  .bind(`legacy-ticket-message:${message.id}`, `legacy-ticket:${message.ticket_id}`, message.sender_user_id ?? null, 'message', String(message.body ?? ''), '{"legacy":true}', Number(message.created_at ?? Date.now())).run();
+            }
+        } catch { /* ticket_id may not exist on very old support_messages */ }
+    } catch { /* support_tickets did not exist */ }
+
+    try {
+        const result = await env.DB.prepare(`SELECT * FROM support_cases ORDER BY created_at DESC LIMIT 500`).all();
+        for (const row of result.results ?? []) {
+            const id = `legacy-case:${row.id}`;
+            const archivedAt = row.archived_at ? Number(row.archived_at) : null;
+            const type = row.kind === 'bug' ? 'bug_report' : 'space_report';
+            await env.DB.prepare(`INSERT OR IGNORE INTO support_cases_v77
+              (id,case_number,case_type,subtype,reporter_id,target_user_id,target_space_id,target_channel_id,subject,answers_json,details,priority,status,assigned_to,source,created_at,updated_at,last_activity_at,resolved_at,resolved_by,archived_at,archived_by)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+              .bind(id, `CASE-${String(row.id).slice(0,8).toUpperCase()}`, type, row.kind === 'bug' ? 'Legacy bug report' : 'Legacy Space report', row.reporter_id, null, row.target_workspace_id ?? null, null, String(row.subject ?? 'Legacy Support case'), String(row.metadata_json ?? '{}'), String(row.details ?? ''), SUPPORT_V77_PRIORITIES.includes(row.priority) ? row.priority : 'normal', supportV77MapLegacyStatus(row.status, archivedAt), row.assigned_to ?? null, 'legacy_case', Number(row.created_at ?? Date.now()), Number(row.updated_at ?? row.created_at ?? Date.now()), Number(row.updated_at ?? row.created_at ?? Date.now()), row.resolved_at ? Number(row.resolved_at) : null, null, archivedAt, row.archived_by ?? null).run();
+        }
+    } catch { /* old support_cases did not exist */ }
+
+    try {
+        const result = await env.DB.prepare(`SELECT * FROM reports ORDER BY created_at DESC LIMIT 500`).all();
+        for (const row of result.results ?? []) {
+            const id = `legacy-report:${row.id}`;
+            const archivedAt = row.archived_at ? Number(row.archived_at) : null;
+            await env.DB.prepare(`INSERT OR IGNORE INTO support_cases_v77
+              (id,case_number,case_type,subtype,reporter_id,target_user_id,target_space_id,target_channel_id,subject,answers_json,details,priority,status,assigned_to,source,created_at,updated_at,last_activity_at,resolved_at,resolved_by,archived_at,archived_by)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+              .bind(id, `REPORT-${String(row.id).slice(0,8).toUpperCase()}`, 'user_report', String(row.reason ?? 'Legacy user report'), row.reporter_id, row.reported_user_id ?? null, row.workspace_id ?? null, null, String(row.reason ?? 'User report'), '{}', String(row.details ?? ''), 'normal', supportV77MapLegacyStatus(row.status, archivedAt), row.reviewed_by ?? null, 'legacy_report', Number(row.created_at ?? Date.now()), Number(row.reviewed_at ?? row.created_at ?? Date.now()), Number(row.reviewed_at ?? row.created_at ?? Date.now()), ['actioned','dismissed'].includes(row.status) ? Number(row.reviewed_at ?? row.created_at ?? Date.now()) : null, row.reviewed_by ?? null, archivedAt, row.archived_by ?? null).run();
+        }
+    } catch { /* reports did not exist */ }
+}
+
+function supportV77Identity(row, prefix) {
+    const id = row[`${prefix}_id`];
+    if (!id) return null;
+    const displayName = String(row[`${prefix}_display_name`] ?? row[`${prefix}_username`] ?? 'Spaces member');
+    return {
+        id: String(id),
+        publicUserId: String(row[`${prefix}_public_user_id`] ?? ''),
+        username: String(row[`${prefix}_username`] ?? ''),
+        displayName,
+        initials: displayName.trim().slice(0,1).toUpperCase() || 'S',
+        avatarUrl: row[`${prefix}_avatar_url`] ?? null,
+        bannerUrl: row[`${prefix}_banner_url`] ?? null,
+        profileAccent: normalizeHexColor(row[`${prefix}_profile_accent`]),
+        bio: String(row[`${prefix}_bio`] ?? ''),
+        platformRole: supportV77ClientRole(row[`${prefix}_platform_role`]),
+        presence: publicVisiblePresence(row[`${prefix}_presence_status`]),
+        customStatus: String(row[`${prefix}_custom_status`] ?? ''),
+    };
+}
+
+async function supportV77CaseRow(env, caseId) {
+    return env.DB.prepare(`SELECT c.*,
+      r.id reporter_id, r.public_user_id reporter_public_user_id, r.username reporter_username, r.display_name reporter_display_name, r.avatar_url reporter_avatar_url, r.banner_url reporter_banner_url, r.profile_accent reporter_profile_accent, r.bio reporter_bio, r.platform_role reporter_platform_role, r.presence_status reporter_presence_status, r.custom_status reporter_custom_status,
+      t.id target_id, t.public_user_id target_public_user_id, t.username target_username, t.display_name target_display_name, t.avatar_url target_avatar_url, t.banner_url target_banner_url, t.profile_accent target_profile_accent, t.bio target_bio, t.platform_role target_platform_role, t.presence_status target_presence_status, t.custom_status target_custom_status,
+      s.name target_space_name, ch.name target_channel_name, a.display_name assigned_to_name
+      FROM support_cases_v77 c
+      JOIN users r ON r.id = c.reporter_id
+      LEFT JOIN users t ON t.id = c.target_user_id
+      LEFT JOIN spaces s ON s.id = c.target_space_id
+      LEFT JOIN channels ch ON ch.id = c.target_channel_id
+      LEFT JOIN users a ON a.id = c.assigned_to
+      WHERE c.id = ? LIMIT 1`).bind(caseId).first();
+}
+
+function supportV77CaseSummary(row) {
+    return {
+      id: row.id,
+      caseNumber: row.case_number,
+      caseType: row.case_type,
+      subtype: row.subtype ?? '',
+      reporter: supportV77Identity(row, 'reporter'),
+      targetUser: supportV77Identity(row, 'target'),
+      targetSpaceId: row.target_space_id ?? null,
+      targetSpaceName: row.target_space_name ?? null,
+      targetChannelId: row.target_channel_id ?? null,
+      targetChannelName: row.target_channel_name ?? null,
+      subject: row.subject,
+      answers: supportV77Json(row.answers_json, {}),
+      details: row.details ?? '',
+      priority: row.priority,
+      status: row.status,
+      assignedTo: row.assigned_to ?? null,
+      assignedToName: row.assigned_to_name ?? null,
+      source: row.source,
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+      lastActivityAt: Number(row.last_activity_at),
+      resolvedAt: row.resolved_at ? Number(row.resolved_at) : null,
+      archivedAt: row.archived_at ? Number(row.archived_at) : null,
+    };
+}
+
+async function supportV77CasePayload(env, caseId, staffView = false) {
+    const row = await supportV77CaseRow(env, caseId);
+    if (!row) return null;
+    const result = await env.DB.prepare(`SELECT e.*, u.display_name actor_name, u.platform_role actor_platform_role
+      FROM support_case_events_v77 e LEFT JOIN users u ON u.id = e.actor_user_id
+      WHERE e.case_id = ? ${staffView ? '' : "AND e.event_type <> 'note'"}
+      ORDER BY e.created_at ASC LIMIT 1200`).bind(caseId).all();
+    return {
+      ...supportV77CaseSummary(row),
+      events: (result.results ?? []).map(event => ({
+        id: event.id, caseId: event.case_id, actorUserId: event.actor_user_id ?? null,
+        actorName: event.actor_name ?? (event.actor_user_id ? 'Spaces member' : 'System'),
+        actorRole: supportV77ClientRole(event.actor_platform_role), eventType: event.event_type,
+        body: event.body ?? '', metadata: supportV77Json(event.metadata_json, {}), createdAt: Number(event.created_at),
+      })),
+    };
+}
+
+async function supportV77CanManage(env, user, caseRow) {
+    if (user.platform_role === 'creator') return true;
+    if (!supportV77IsTeam(user)) return false;
+    const permissions = await supportPermissionsForUserV48(env, user);
+    if (caseRow?.case_type === 'bug_report') return permissions.includes('manage_bugs') || permissions.includes('manage_reports');
+    return permissions.includes('manage_reports');
+}
+
+async function listSupportCasesV77(request, env) {
+    const support = await requireSupportCapability(request, env, 'view_reports');
+    if ('response' in support) return support.response;
+    await supportV77SyncLegacy(env);
+    const result = await env.DB.prepare(`SELECT c.*,
+      r.id reporter_id, r.public_user_id reporter_public_user_id, r.username reporter_username, r.display_name reporter_display_name, r.avatar_url reporter_avatar_url, r.banner_url reporter_banner_url, r.profile_accent reporter_profile_accent, r.bio reporter_bio, r.platform_role reporter_platform_role, r.presence_status reporter_presence_status, r.custom_status reporter_custom_status,
+      t.id target_id, t.public_user_id target_public_user_id, t.username target_username, t.display_name target_display_name, t.avatar_url target_avatar_url, t.banner_url target_banner_url, t.profile_accent target_profile_accent, t.bio target_bio, t.platform_role target_platform_role, t.presence_status target_presence_status, t.custom_status target_custom_status,
+      s.name target_space_name, ch.name target_channel_name, a.display_name assigned_to_name
+      FROM support_cases_v77 c JOIN users r ON r.id=c.reporter_id
+      LEFT JOIN users t ON t.id=c.target_user_id LEFT JOIN spaces s ON s.id=c.target_space_id LEFT JOIN channels ch ON ch.id=c.target_channel_id LEFT JOIN users a ON a.id=c.assigned_to
+      ORDER BY CASE c.status WHEN 'waiting' THEN 0 WHEN 'reviewing' THEN 1 WHEN 'resolved' THEN 2 ELSE 3 END, c.last_activity_at DESC LIMIT 800`).all();
+    return json((result.results ?? []).map(supportV77CaseSummary));
+}
+
+async function listMySupportCasesV77(request, env) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+    await supportV77SyncLegacy(env);
+    const result = await env.DB.prepare(`SELECT c.*,
+      r.id reporter_id, r.public_user_id reporter_public_user_id, r.username reporter_username, r.display_name reporter_display_name, r.avatar_url reporter_avatar_url, r.banner_url reporter_banner_url, r.profile_accent reporter_profile_accent, r.bio reporter_bio, r.platform_role reporter_platform_role, r.presence_status reporter_presence_status, r.custom_status reporter_custom_status,
+      t.id target_id, t.public_user_id target_public_user_id, t.username target_username, t.display_name target_display_name, t.avatar_url target_avatar_url, t.banner_url target_banner_url, t.profile_accent target_profile_accent, t.bio target_bio, t.platform_role target_platform_role, t.presence_status target_presence_status, t.custom_status target_custom_status,
+      s.name target_space_name, ch.name target_channel_name, a.display_name assigned_to_name
+      FROM support_cases_v77 c JOIN users r ON r.id=c.reporter_id
+      LEFT JOIN users t ON t.id=c.target_user_id LEFT JOIN spaces s ON s.id=c.target_space_id LEFT JOIN channels ch ON ch.id=c.target_channel_id LEFT JOIN users a ON a.id=c.assigned_to
+      WHERE c.reporter_id = ? ORDER BY c.last_activity_at DESC LIMIT 200`).bind(auth.user.id).all();
+    return json((result.results ?? []).map(supportV77CaseSummary));
+}
+
+async function createSupportCaseV77(request, env) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+    const body = await readJson(request);
+    const caseType = SUPPORT_V77_CASE_TYPES.includes(body.caseType) ? body.caseType : 'request';
+    const subtype = String(body.subtype ?? '').trim().slice(0,120);
+    const subject = String(body.subject ?? '').trim().slice(0,180) || 'Support request';
+    const details = String(body.details ?? '').trim().slice(0,5000);
+    const answers = body.answers && typeof body.answers === 'object' ? body.answers : {};
+    const priority = SUPPORT_V77_PRIORITIES.includes(body.priority) ? body.priority : 'normal';
+    let targetUserId = body.targetUserId ? String(body.targetUserId) : null;
+    if (!targetUserId && body.targetUsername) {
+        const target = await env.DB.prepare(`SELECT id FROM users WHERE username = ? LIMIT 1`).bind(normalizeUsername(body.targetUsername)).first();
+        targetUserId = target?.id ?? null;
+    }
+    if (caseType === 'user_report' && !targetUserId) return fail('Choose a user to report.');
+    if (targetUserId === auth.user.id) return fail('You cannot report your own account.');
+    const targetSpaceId = body.targetSpaceId ? String(body.targetSpaceId) : null;
+    const targetChannelId = body.targetChannelId ? String(body.targetChannelId) : null;
+    if (targetSpaceId) {
+        const space = await env.DB.prepare(`SELECT id,owner_user_id FROM spaces WHERE id = ? LIMIT 1`).bind(targetSpaceId).first();
+        if (!space) return fail('Space not found.', 404);
+        if (caseType === 'space_report' && !targetUserId) targetUserId = space.owner_user_id ?? null;
+    }
+    if (targetChannelId) {
+        const channel = await env.DB.prepare(`SELECT id,space_id FROM channels WHERE id = ? LIMIT 1`).bind(targetChannelId).first();
+        if (!channel || (targetSpaceId && channel.space_id !== targetSpaceId)) return fail('Channel not found.', 404);
+    }
+    const id = crypto.randomUUID();
+    const now = Date.now();
+    const caseNumber = supportV77CaseNumber();
+    await env.DB.prepare(`INSERT INTO support_cases_v77
+      (id,case_number,case_type,subtype,reporter_id,target_user_id,target_space_id,target_channel_id,subject,answers_json,details,priority,status,assigned_to,source,created_at,updated_at,last_activity_at,resolved_at,resolved_by,archived_at,archived_by)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'waiting', NULL, ?,?,?,?,NULL,NULL,NULL,NULL)`)
+      .bind(id,caseNumber,caseType,subtype,auth.user.id,targetUserId,targetSpaceId,targetChannelId,subject,JSON.stringify(answers),details,priority,String(body.source ?? 'support_bot').slice(0,80),now,now,now).run();
+    await env.DB.prepare(`INSERT INTO support_case_events_v77 (id,case_id,actor_user_id,event_type,body,metadata_json,created_at) VALUES (?,?,?,?,?,?,?)`)
+      .bind(crypto.randomUUID(),id,auth.user.id,'opened',details || subtype,JSON.stringify({caseType,subtype}),now).run();
+    return json(await supportV77CasePayload(env,id,false),201);
+}
+
+async function supportV77CaseAccess(request, env, caseId) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth;
+    const row = await env.DB.prepare(`SELECT * FROM support_cases_v77 WHERE id = ? LIMIT 1`).bind(caseId).first();
+    if (!row) return { response: fail('Support case not found.',404) };
+    const staff = supportV77IsTeam(auth.user);
+    if (row.reporter_id !== auth.user.id && !staff) return { response: fail('Support case not found.',404) };
+    if (staff) {
+        const permissions = await supportPermissionsForUserV48(env,auth.user);
+        if (!permissions.includes('view_reports')) return { response: fail('Support permission required: view_reports.',403) };
+        return { user: auth.user, row, staff: true, permissions };
+    }
+    return { user: auth.user, row, staff: false, permissions: [] };
+}
+
+async function getSupportCaseV77(request, env, caseId) {
+    const access = await supportV77CaseAccess(request,env,caseId);
+    if ('response' in access) return access.response;
+    return json(await supportV77CasePayload(env,caseId,access.staff));
+}
+
+async function updateSupportCaseV77(request, env, caseId) {
+    const access = await supportV77CaseAccess(request,env,caseId);
+    if ('response' in access) return access.response;
+    const body = await readJson(request);
+    const action = String(body.action ?? '');
+    const now = Date.now();
+    const before = { status: access.row.status, assignedTo: access.row.assigned_to ?? null };
+    if (!access.staff) {
+        if (action !== 'reopen' || !['resolved','archived'].includes(access.row.status)) return fail('That case cannot be changed.',403);
+        await env.DB.prepare(`UPDATE support_cases_v77 SET status='reviewing', resolved_at=NULL,resolved_by=NULL,archived_at=NULL,archived_by=NULL,updated_at=?,last_activity_at=? WHERE id=?`).bind(now,now,caseId).run();
+        await env.DB.prepare(`INSERT INTO support_case_events_v77 (id,case_id,actor_user_id,event_type,body,metadata_json,created_at) VALUES (?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),caseId,access.user.id,'reopened','Case reopened by member.','{}',now).run();
+        return json(await supportV77CasePayload(env,caseId,false));
+    }
+    if (!(await supportV77CanManage(env,access.user,access.row))) return fail('Support permission required to manage this case.',403);
+    if (action === 'take') await env.DB.prepare(`UPDATE support_cases_v77 SET assigned_to=?,status='reviewing',updated_at=?,last_activity_at=? WHERE id=?`).bind(access.user.id,now,now,caseId).run();
+    else if (action === 'release') await env.DB.prepare(`UPDATE support_cases_v77 SET assigned_to=NULL,status='waiting',updated_at=?,last_activity_at=? WHERE id=?`).bind(now,now,caseId).run();
+    else if (action === 'reviewing') await env.DB.prepare(`UPDATE support_cases_v77 SET status='reviewing',assigned_to=COALESCE(assigned_to,?),updated_at=?,last_activity_at=? WHERE id=?`).bind(access.user.id,now,now,caseId).run();
+    else if (action === 'resolve') await env.DB.prepare(`UPDATE support_cases_v77 SET status='resolved',resolved_at=?,resolved_by=?,updated_at=?,last_activity_at=? WHERE id=?`).bind(now,access.user.id,now,now,caseId).run();
+    else if (action === 'archive') {
+        if (access.row.status !== 'resolved') return fail('Resolve the case before archiving it.',409);
+        await env.DB.prepare(`UPDATE support_cases_v77 SET status='archived',archived_at=?,archived_by=?,updated_at=?,last_activity_at=? WHERE id=?`).bind(now,access.user.id,now,now,caseId).run();
+    } else if (action === 'reopen') await env.DB.prepare(`UPDATE support_cases_v77 SET status='reviewing',assigned_to=COALESCE(assigned_to,?),resolved_at=NULL,resolved_by=NULL,archived_at=NULL,archived_by=NULL,updated_at=?,last_activity_at=? WHERE id=?`).bind(access.user.id,now,now,caseId).run();
+    else return fail('Unknown case action.');
+    const afterRow = await env.DB.prepare(`SELECT status,assigned_to FROM support_cases_v77 WHERE id=?`).bind(caseId).first();
+    await env.DB.prepare(`INSERT INTO support_case_events_v77 (id,case_id,actor_user_id,event_type,body,metadata_json,created_at) VALUES (?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),caseId,access.user.id,action,`Case ${action}.`,JSON.stringify({before,after:afterRow}),now).run();
+    await supportV77Audit(env,access.user,`case.${action}`,'case',caseId,caseId,'','',before,afterRow ?? {},null);
+    return json(await supportV77CasePayload(env,caseId,true));
+}
+
+// SPACES_V77_7_PERMANENT_DELETE
+async function supportV77DeleteLegacyBackingV777(env, row) {
+    const source = String(row.source ?? '');
+    const caseId = String(row.id ?? '');
+    if (source === 'legacy_ticket') {
+        const legacyId = caseId.startsWith('legacy-ticket:') ? caseId.slice('legacy-ticket:'.length) : '';
+        if (!legacyId) throw new Error('Legacy Support ticket id is missing.');
+        try { await env.DB.prepare(`DELETE FROM support_messages WHERE ticket_id = ?`).bind(legacyId).run(); } catch {}
+        try { await env.DB.prepare(`DELETE FROM support_ticket_events WHERE ticket_id = ?`).bind(legacyId).run(); } catch {}
+        await env.DB.prepare(`DELETE FROM support_tickets WHERE id = ?`).bind(legacyId).run();
+        const stillThere = await env.DB.prepare(`SELECT id FROM support_tickets WHERE id = ? LIMIT 1`).bind(legacyId).first();
+        if (stillThere) throw new Error('Legacy Support ticket still exists after delete.');
+    } else if (source === 'legacy_case') {
+        const legacyId = caseId.startsWith('legacy-case:') ? caseId.slice('legacy-case:'.length) : '';
+        if (!legacyId) throw new Error('Legacy Support case id is missing.');
+        try { await env.DB.prepare(`DELETE FROM support_messages WHERE case_id = ?`).bind(legacyId).run(); } catch {}
+        await env.DB.prepare(`DELETE FROM support_cases WHERE id = ?`).bind(legacyId).run();
+        const stillThere = await env.DB.prepare(`SELECT id FROM support_cases WHERE id = ? LIMIT 1`).bind(legacyId).first();
+        if (stillThere) throw new Error('Legacy Support case still exists after delete.');
+    } else if (source === 'legacy_report') {
+        const legacyId = caseId.startsWith('legacy-report:') ? caseId.slice('legacy-report:'.length) : '';
+        if (!legacyId) throw new Error('Legacy report id is missing.');
+        await env.DB.prepare(`DELETE FROM reports WHERE id = ?`).bind(legacyId).run();
+        const stillThere = await env.DB.prepare(`SELECT id FROM reports WHERE id = ? LIMIT 1`).bind(legacyId).first();
+        if (stillThere) throw new Error('Legacy report still exists after delete.');
+    }
+}
+
+async function deleteSupportCaseV77(request, env, caseId) {
+    const support = await requireSupportConsole(request,env);
+    if ('response' in support) return support.response;
+    if (support.user.platform_role !== 'creator') return fail('Only the Founder can permanently delete archived cases.',403);
+    const row = await env.DB.prepare(`SELECT id,case_number,status,source FROM support_cases_v77 WHERE id=? LIMIT 1`).bind(caseId).first();
+    if (!row) return fail('Support case not found.',404);
+    if (row.status !== 'archived') return fail('Only archived cases can be permanently deleted.',409);
+
+    // Remove the original V73/V75 backing row first. If that fails, keep the V77
+    // case visible instead of returning success and letting legacy sync recreate it.
+    try { await supportV77DeleteLegacyBackingV777(env,row); }
+    catch (caught) { console.error('V77 permanent delete could not remove legacy backing data.',caught); return fail('Permanent deletion could not remove the original Support record.',500); }
+
+    // Active moderation restrictions remain enforced, but lose the case link.
+    await env.DB.prepare(`UPDATE support_restrictions_v77 SET case_id=NULL WHERE case_id=?`).bind(caseId).run();
+    // Delete every case-linked audit/timeline/collaborator record before the case.
+    await env.DB.prepare(`DELETE FROM support_audit_v77 WHERE case_id=? OR (target_type='case' AND target_id=?)`).bind(caseId,caseId).run();
+    await env.DB.prepare(`DELETE FROM support_case_collaborators_v77 WHERE case_id=?`).bind(caseId).run();
+    await env.DB.prepare(`DELETE FROM support_case_events_v77 WHERE case_id=?`).bind(caseId).run();
+    await env.DB.prepare(`DELETE FROM support_cases_v77 WHERE id=?`).bind(caseId).run();
+
+    const stillThere = await env.DB.prepare(`SELECT id FROM support_cases_v77 WHERE id=? LIMIT 1`).bind(caseId).first();
+    if (stillThere) return fail('Permanent deletion did not complete.',500);
+    return new Response(null,{status:204,headers:corsHeaders()});
+}
+
+async function addSupportCaseEventV77(request, env, caseId) {
+    const access = await supportV77CaseAccess(request,env,caseId);
+    if ('response' in access) return access.response;
+    const body = await readJson(request);
+    const eventType = String(body.eventType ?? 'message');
+    const message = String(body.body ?? '').trim().slice(0,5000);
+    if (!message) return fail('Message cannot be empty.');
+    if (!access.staff && eventType !== 'message') return fail('Members can only reply to their Support case.',403);
+    if (!access.staff && ['resolved','archived'].includes(access.row.status)) return fail('Reopen the case before replying.',409);
+    if (access.staff && !(await supportV77CanManage(env,access.user,access.row))) return fail('Support permission required to reply to this case.',403);
+    if (access.staff && !['message','note'].includes(eventType)) return fail('Invalid Support event type.');
+    const now = Date.now();
+    await env.DB.prepare(`INSERT INTO support_case_events_v77 (id,case_id,actor_user_id,event_type,body,metadata_json,created_at) VALUES (?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),caseId,access.user.id,eventType,message,'{}',now).run();
+    if (access.staff && eventType === 'message' && access.row.status === 'waiting') {
+        await env.DB.prepare(`UPDATE support_cases_v77 SET status='reviewing',assigned_to=COALESCE(assigned_to,?),updated_at=?,last_activity_at=? WHERE id=?`).bind(access.user.id,now,now,caseId).run();
+    } else {
+        await env.DB.prepare(`UPDATE support_cases_v77 SET updated_at=?,last_activity_at=? WHERE id=?`).bind(now,now,caseId).run();
+    }
+    return json(await supportV77CasePayload(env,caseId,access.staff),201);
+}
+
+async function supportProfileV77(request, env, userId) {
+    const auth = await requireUser(request,env);
+    if ('response' in auth) return auth.response;
+    const target = await env.DB.prepare(`SELECT * FROM users WHERE id=? LIMIT 1`).bind(userId).first();
+    if (!target) return fail('Profile not found.',404);
+    const isTeam = supportV77IsTeam(auth.user);
+    const shared = await env.DB.prepare(`SELECT s.id,s.name,theirs.role FROM space_members mine JOIN space_members theirs ON theirs.space_id=mine.space_id JOIN spaces s ON s.id=mine.space_id WHERE mine.user_id=? AND theirs.user_id=? ORDER BY s.name LIMIT 100`).bind(auth.user.id,userId).all();
+    const direct = await env.DB.prepare(`SELECT id FROM direct_conversations WHERE status='accepted' AND ((user_low_id=? AND user_high_id=?) OR (user_low_id=? AND user_high_id=?)) LIMIT 1`).bind(auth.user.id,userId,userId,auth.user.id).first();
+    if (userId !== auth.user.id && !isTeam && !Boolean(target.public_profile) && !(shared.results ?? []).length && !direct) return fail('Profile is not available.',403);
+    const base = publicProfile(target);
+    base.presence = publicVisiblePresence(target.presence_status);
+    let activeRestrictions = [];
+    let recentCases = [];
+    if (isTeam) {
+        const permissions = await supportPermissionsForUserV48(env,auth.user);
+        if (permissions.includes('view_accounts')) {
+            const restrictions = await env.DB.prepare(`SELECT r.*, u.display_name created_by_name FROM support_restrictions_v77 r LEFT JOIN users u ON u.id=r.created_by WHERE r.target_type='user' AND r.target_id=? AND r.active=1 AND (r.expires_at IS NULL OR r.expires_at>?) ORDER BY r.created_at DESC LIMIT 50`).bind(userId,Date.now()).all();
+            activeRestrictions = (restrictions.results ?? []).map(row => supportV77RestrictionPayload(row,target.display_name));
+            const cases = await env.DB.prepare(`SELECT id,case_number,case_type,subject,status,updated_at FROM support_cases_v77 WHERE reporter_id=? OR target_user_id=? ORDER BY updated_at DESC LIMIT 30`).bind(userId,userId).all();
+            recentCases = (cases.results ?? []).map(row => ({id:row.id,caseNumber:row.case_number,caseType:row.case_type,subject:row.subject,status:row.status,updatedAt:Number(row.updated_at)}));
+        }
+    }
+    return json({...base,sharedSpaces:(shared.results ?? []).map(row=>({id:row.id,name:row.name,role:row.role})),activeRestrictions,recentCases});
+}
+
+function supportV77RestrictionPayload(row, targetLabel = '') {
+    return { id:row.id,targetType:row.target_type,targetId:row.target_id,targetLabel:targetLabel || row.target_label || row.target_id,capability:row.capability,reasonCategory:row.reason_category,note:row.note ?? '',createdBy:row.created_by,createdByName:row.created_by_name ?? 'Support',createdAt:Number(row.created_at),expiresAt:row.expires_at?Number(row.expires_at):null,active:Boolean(row.active)&&(!row.expires_at||Number(row.expires_at)>Date.now()),caseId:row.case_id??null };
+}
+
+async function supportV77RestrictionPermission(env, user, targetType, capability) {
+    if (user.platform_role === 'creator') return true;
+    const permissions = await supportPermissionsForUserV48(env,user);
+    if (targetType === 'space' || targetType === 'channel') return permissions.includes('space_restrict');
+    if (capability === 'platform_access') return permissions.includes('ban_users');
+    if (capability === 'create_spaces') return permissions.includes('space_create_restrict');
+    if (capability === 'join_spaces') return permissions.includes('space_join_restrict');
+    return permissions.includes('chat_restrict');
+}
+
+async function createSupportRestrictionV77(request, env) {
+    const support = await requireSupportConsole(request,env);
+    if ('response' in support) return support.response;
+    const body = await readJson(request);
+    const targetType = ['user','space','channel'].includes(body.targetType) ? body.targetType : '';
+    const targetId = String(body.targetId ?? '');
+    const capability = String(body.capability ?? '');
+    if (!targetType || !targetId) return fail('Restriction target is required.');
+    const allowed = targetType === 'user' ? SUPPORT_V77_USER_CAPABILITIES : targetType === 'space' ? SUPPORT_V77_SPACE_CAPABILITIES : SUPPORT_V77_CHANNEL_CAPABILITIES;
+    if (!allowed.includes(capability)) return fail('Invalid restriction capability.');
+    if (!(await supportV77RestrictionPermission(env,support.user,targetType,capability))) return fail('Your Support role cannot apply that restriction.',403);
+    let targetLabel = targetId;
+    if (targetType === 'user') {
+        const target = await env.DB.prepare(`SELECT id,display_name,platform_role FROM users WHERE id=? LIMIT 1`).bind(targetId).first();
+        if (!target) return fail('Account not found.',404);
+        if (!supportRoleCanActOn(support.user.platform_role,target.platform_role)) return fail('Your Support role cannot act on that account.',403);
+        targetLabel = target.display_name;
+    } else if (targetType === 'space') {
+        const target = await env.DB.prepare(`SELECT id,name FROM spaces WHERE id=? LIMIT 1`).bind(targetId).first(); if (!target) return fail('Space not found.',404); targetLabel=target.name;
+    } else {
+        const target = await env.DB.prepare(`SELECT c.id,c.name,s.name space_name FROM channels c JOIN spaces s ON s.id=c.space_id WHERE c.id=? LIMIT 1`).bind(targetId).first(); if (!target) return fail('Channel not found.',404); targetLabel=`${target.space_name} / #${target.name}`;
+    }
+    const duration = body.durationMinutes === null || body.durationMinutes === undefined ? null : Number(body.durationMinutes);
+    const expiresAt = Number.isFinite(duration) && duration > 0 ? Date.now()+Math.min(duration,525600)*60000 : null;
+    const reasonCategory = String(body.reasonCategory ?? 'Other').slice(0,120);
+    const note = String(body.note ?? '').slice(0,1200);
+    const id = crypto.randomUUID(); const now=Date.now();
+    await env.DB.prepare(`INSERT INTO support_restrictions_v77 (id,target_type,target_id,capability,reason_category,note,created_by,created_at,expires_at,active,revoked_at,revoked_by,case_id) VALUES (?,?,?,?,?,?,?,?,?,1,NULL,NULL,?)`).bind(id,targetType,targetId,capability,reasonCategory,note,support.user.id,now,expiresAt,body.caseId?String(body.caseId):null).run();
+    if (targetType === 'user' && capability === 'platform_access') await env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(targetId).run();
+    await supportV77Audit(env,support.user,'restriction.applied',targetType,targetId,body.caseId?String(body.caseId):null,reasonCategory,note,{}, {capability}, expiresAt);
+    return json(supportV77RestrictionPayload({id,target_type:targetType,target_id:targetId,capability,reason_category:reasonCategory,note,created_by:support.user.id,created_by_name:support.user.display_name,created_at:now,expires_at:expiresAt,active:1,case_id:body.caseId??null},targetLabel),201);
+}
+
+async function listSupportRestrictionsV77(request, env) {
+    const support = await requireSupportConsole(request,env);
+    if ('response' in support) return support.response;
+    const permissions = await supportPermissionsForUserV48(env,support.user);
+    if (support.user.platform_role !== 'creator' && !permissions.includes('view_accounts')) return fail('Support permission required: view_accounts.',403);
+    const now=Date.now();
+    const result=await env.DB.prepare(`SELECT r.*,u.display_name created_by_name,
+      CASE r.target_type WHEN 'user' THEN tu.display_name WHEN 'space' THEN s.name WHEN 'channel' THEN ch.name ELSE r.target_id END target_label
+      FROM support_restrictions_v77 r LEFT JOIN users u ON u.id=r.created_by LEFT JOIN users tu ON r.target_type='user' AND tu.id=r.target_id LEFT JOIN spaces s ON r.target_type='space' AND s.id=r.target_id LEFT JOIN channels ch ON r.target_type='channel' AND ch.id=r.target_id
+      WHERE r.active=1 AND (r.expires_at IS NULL OR r.expires_at>?) ORDER BY r.created_at DESC LIMIT 500`).bind(now).all();
+    return json((result.results??[]).map(row=>supportV77RestrictionPayload(row,row.target_label)));
+}
+
+async function revokeSupportRestrictionV77(request, env, restrictionId) {
+    const support=await requireSupportConsole(request,env); if('response' in support)return support.response;
+    const row=await env.DB.prepare(`SELECT * FROM support_restrictions_v77 WHERE id=? LIMIT 1`).bind(restrictionId).first(); if(!row)return fail('Restriction not found.',404);
+    if(!(await supportV77RestrictionPermission(env,support.user,row.target_type,row.capability)))return fail('Your Support role cannot remove that restriction.',403);
+    if(row.target_type==='user'){const target=await env.DB.prepare(`SELECT platform_role FROM users WHERE id=?`).bind(row.target_id).first();if(target&&!supportRoleCanActOn(support.user.platform_role,target.platform_role))return fail('Your Support role cannot act on that account.',403);}
+    const now=Date.now();await env.DB.prepare(`UPDATE support_restrictions_v77 SET active=0,revoked_at=?,revoked_by=? WHERE id=?`).bind(now,support.user.id,restrictionId).run();
+    await supportV77Audit(env,support.user,'restriction.revoked',row.target_type,row.target_id,row.case_id??null,row.reason_category,'Restriction removed.',{capability:row.capability},{active:false},null);
+    return new Response(null,{status:204,headers:corsHeaders()});
+}
+
+async function sendSupportNoticeV77(request, env) {
+    const support = await requireSupportCapability(request,env,'send_support_dms');
+    if ('response' in support) return support.response;
+    const body = await readJson(request);
+    const recipientUserId = String(body.recipientUserId ?? '');
+    const subject = String(body.subject ?? 'Spaces Support notice').trim().slice(0,180);
+    const message = String(body.body ?? '').trim().slice(0,5000);
+    if (!recipientUserId || !message) return fail('Recipient and message are required.');
+    const recipient = await env.DB.prepare(`SELECT id,display_name,platform_role FROM users WHERE id=? LIMIT 1`).bind(recipientUserId).first();
+    if (!recipient) return fail('Account not found.',404);
+    const now=Date.now(); const id=crypto.randomUUID(); const caseNumber=supportV77CaseNumber();
+    await env.DB.prepare(`INSERT INTO support_cases_v77
+      (id,case_number,case_type,subtype,reporter_id,target_user_id,target_space_id,target_channel_id,subject,answers_json,details,priority,status,assigned_to,source,created_at,updated_at,last_activity_at,resolved_at,resolved_by,archived_at,archived_by)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'reviewing', ?, 'staff_created', ?,?,?,NULL,NULL,NULL,NULL)`)
+      .bind(id,caseNumber,'request','Support notice',recipientUserId,recipientUserId,body.targetSpaceId?String(body.targetSpaceId):null,null,subject,'{}','',String(body.priority??'normal'),support.user.id,now,now,now).run();
+    await env.DB.prepare(`INSERT INTO support_case_events_v77 (id,case_id,actor_user_id,event_type,body,metadata_json,created_at) VALUES (?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),id,support.user.id,'message',message,JSON.stringify({notice:true}),now).run();
+    await supportV77Audit(env,support.user,'support.notice_sent','user',recipientUserId,id,String(body.reasonCategory??'Support notice'),'',{}, {caseNumber},null);
+    return json(await supportV77CasePayload(env,id,true),201);
+}
+
+async function listSupportAuditV77(request, env) {
+    const support=await requireSupportConsole(request,env);if('response' in support)return support.response;
+    const permissions=await supportPermissionsForUserV48(env,support.user);if(support.user.platform_role!=='creator'&&!permissions.includes('view_audit'))return fail('Support permission required: view_audit.',403);
+    const result=await env.DB.prepare(`SELECT a.*,u.display_name actor_name,
+      CASE a.target_type WHEN 'user' THEN tu.display_name WHEN 'space' THEN s.name WHEN 'channel' THEN ch.name ELSE a.target_id END target_label
+      FROM support_audit_v77 a LEFT JOIN users u ON u.id=a.actor_id LEFT JOIN users tu ON a.target_type='user' AND tu.id=a.target_id LEFT JOIN spaces s ON a.target_type='space' AND s.id=a.target_id LEFT JOIN channels ch ON a.target_type='channel' AND ch.id=a.target_id
+      ORDER BY a.created_at DESC LIMIT 800`).all();
+    return json((result.results??[]).map(row=>({id:row.id,actorId:row.actor_id,actorName:row.actor_name??'Support',actorRole:supportV77ClientRole(row.actor_role),action:row.action,targetType:row.target_type,targetId:row.target_id,targetLabel:row.target_label??row.target_id,caseId:row.case_id??null,reasonCategory:row.reason_category??'',note:row.note??'',expiresAt:row.expires_at?Number(row.expires_at):null,createdAt:Number(row.created_at)})));
+}
+// ---- End Spaces V77 Support Operations ---------------------------------------------
+
+
 async function listSupportCases(request, env) {
     const support = await requireSupportCapability(request, env, 'view_reports');
     if ('response' in support) return support.response;
@@ -10046,6 +11058,693 @@ async function updateSupportCase(request, env, caseId) {
     await env.DB.prepare(`UPDATE support_cases SET status = ?, priority = ?, assigned_to = ?, updated_at = ?, resolved_at = ? WHERE id = ?`)
       .bind(nextStatus, nextPriority, assignedTo, now, ['resolved','dismissed','actioned'].includes(nextStatus) ? now : null, caseId).run();
     return getSupportCaseById(env, caseId);
+}
+
+
+const SUPPORT_TICKET_STATUSES_V73 = new Set(['waiting', 'taken', 'reviewing', 'resolving', 'resolved']);
+const SUPPORT_TICKET_RETENTION_MS_V73 = 60 * 24 * 60 * 60 * 1000;
+
+function isSupportTeamUserV73(user) {
+    return ['creator', 'staff', 'support'].includes(String(user?.platform_role ?? ''));
+}
+
+async function supportTicketDefaultRecipientV73(env) {
+    return env.DB.prepare(`SELECT id, display_name, username
+      FROM users
+      WHERE platform_role IN ('creator', 'staff', 'support')
+      ORDER BY CASE platform_role WHEN 'creator' THEN 0 WHEN 'staff' THEN 1 ELSE 2 END,
+               created_at ASC
+      LIMIT 1`).first();
+}
+
+async function uniqueSupportTicketNumberV73(env) {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+        let code = 'SP-';
+        for (let i = 0; i < 6; i += 1) {
+            code += alphabet[Math.floor(Math.random() * alphabet.length)];
+        }
+        const existing = await env.DB.prepare(
+            `SELECT id FROM support_tickets WHERE ticket_number = ? LIMIT 1`
+        ).bind(code).first();
+        if (!existing) return code;
+    }
+    return `SP-${randomAlphaNumeric(10).toUpperCase()}`;
+}
+
+async function addSupportTicketEventV73(env, ticketId, actorUserId, eventType, metadata = {}) {
+    await env.DB.prepare(`INSERT INTO support_ticket_events
+      (id, ticket_id, actor_user_id, event_type, metadata_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)`)
+      .bind(
+        crypto.randomUUID(),
+        ticketId,
+        actorUserId || null,
+        eventType,
+        JSON.stringify(metadata ?? {}),
+        Date.now(),
+      )
+      .run();
+}
+
+async function cleanupExpiredSupportTicketTranscriptsV73(env) {
+    const now = Date.now();
+    const expired = await env.DB.prepare(`SELECT id
+      FROM support_tickets
+      WHERE status = 'resolved'
+        AND delete_after IS NOT NULL
+        AND delete_after <= ?
+        AND transcript_deleted_at IS NULL
+      LIMIT 100`).bind(now).all();
+
+    for (const row of expired.results ?? []) {
+        await env.DB.prepare(`DELETE FROM support_messages WHERE ticket_id = ?`)
+          .bind(row.id)
+          .run();
+        await env.DB.prepare(`UPDATE support_tickets
+          SET transcript_deleted_at = ?, updated_at = ?
+          WHERE id = ?`)
+          .bind(now, now, row.id)
+          .run();
+        await addSupportTicketEventV73(
+          env,
+          row.id,
+          null,
+          'auto_transcript_deleted',
+          { retentionDays: 60 },
+        );
+    }
+}
+
+async function supportTicketRowV73(env, ticketNumber) {
+    return env.DB.prepare(`SELECT
+        t.*,
+        owner.display_name AS user_name,
+        owner.username AS username,
+        owner.public_user_id AS user_public_user_id,
+        owner.avatar_url AS user_avatar_url,
+        assignee.display_name AS assigned_name,
+        assignee.username AS assigned_username
+      FROM support_tickets t
+      JOIN users owner ON owner.id = t.user_id
+      LEFT JOIN users assignee ON assignee.id = t.assigned_to
+      WHERE t.ticket_number = ?
+      LIMIT 1`)
+      .bind(ticketNumber)
+      .first();
+}
+
+function supportTicketPayloadV73(row) {
+    return {
+        id: row.id,
+        ticketNumber: row.ticket_number,
+        userId: row.user_id,
+        userName: row.user_name,
+        username: row.username,
+        userPublicUserId: row.user_public_user_id ?? '',
+        userAvatarUrl: row.user_avatar_url ?? null,
+        topic: row.topic,
+        status: row.status,
+        assignedTo: row.assigned_to ?? null,
+        assignedName: row.assigned_name ?? null,
+        assignedUsername: row.assigned_username ?? null,
+        createdAt: Number(row.created_at ?? 0),
+        updatedAt: Number(row.updated_at ?? 0),
+        resolvedAt: row.resolved_at ? Number(row.resolved_at) : null,
+        lastActivityAt: Number(row.last_activity_at ?? row.updated_at ?? row.created_at ?? 0),
+        deleteAfter: row.delete_after ? Number(row.delete_after) : null,
+        reopenedAt: row.reopened_at ? Number(row.reopened_at) : null,
+        transcriptDeletedAt: row.transcript_deleted_at ? Number(row.transcript_deleted_at) : null,
+    };
+}
+
+async function supportTicketDetailForUserV73(env, authUser, ticketNumber) {
+    await cleanupExpiredSupportTicketTranscriptsV73(env);
+    const row = await supportTicketRowV73(env, ticketNumber);
+    if (!row) return null;
+
+    const staff = isSupportTeamUserV73(authUser);
+    if (!staff && row.user_id !== authUser.id) return null;
+
+    const messages = await env.DB.prepare(`SELECT
+        m.id,
+        m.ticket_id,
+        m.recipient_user_id,
+        recipient.display_name AS recipient_name,
+        m.sender_user_id,
+        sender.display_name AS sender_name,
+        sender.username AS sender_username,
+        m.subject,
+        m.body,
+        m.message_kind,
+        m.created_at,
+        m.read_at
+      FROM support_messages m
+      JOIN users recipient ON recipient.id = m.recipient_user_id
+      JOIN users sender ON sender.id = m.sender_user_id
+      WHERE m.ticket_id = ?
+      ORDER BY m.created_at ASC
+      LIMIT 1000`)
+      .bind(row.id)
+      .all();
+
+    await env.DB.prepare(`UPDATE support_messages
+      SET read_at = COALESCE(read_at, ?)
+      WHERE ticket_id = ?
+        AND recipient_user_id = ?
+        AND read_at IS NULL`)
+      .bind(Date.now(), row.id, authUser.id)
+      .run();
+
+    const events = await env.DB.prepare(`SELECT
+        e.id,
+        e.actor_user_id,
+        actor.display_name AS actor_name,
+        e.event_type,
+        e.metadata_json,
+        e.created_at
+      FROM support_ticket_events e
+      LEFT JOIN users actor ON actor.id = e.actor_user_id
+      WHERE e.ticket_id = ?
+      ORDER BY e.created_at ASC
+      LIMIT 1000`)
+      .bind(row.id)
+      .all();
+
+    const collaborators = await env.DB.prepare(`SELECT
+        c.user_id,
+        u.display_name,
+        u.username,
+        u.public_user_id,
+        u.platform_role
+      FROM support_ticket_collaborators c
+      JOIN users u ON u.id = c.user_id
+      WHERE c.ticket_id = ?
+      ORDER BY c.added_at ASC`)
+      .bind(row.id)
+      .all();
+
+    return {
+        ticket: supportTicketPayloadV73(row),
+        messages: (messages.results ?? []).map(message => ({
+            id: message.id,
+            ticketId: message.ticket_id,
+            recipientUserId: message.recipient_user_id,
+            recipientName: message.recipient_name,
+            senderUserId: message.sender_user_id,
+            senderName: message.sender_name,
+            senderUsername: message.sender_username,
+            subject: message.subject,
+            body: message.body,
+            messageKind: message.message_kind ?? 'official',
+            createdAt: Number(message.created_at ?? 0),
+            readAt: message.read_at ? Number(message.read_at) : null,
+        })),
+        events: (events.results ?? []).map(event => {
+            let metadata = {};
+            try { metadata = JSON.parse(event.metadata_json || '{}'); } catch { metadata = {}; }
+            return {
+                id: event.id,
+                eventType: event.event_type,
+                actorUserId: event.actor_user_id ?? null,
+                actorName: event.actor_name ?? null,
+                metadata,
+                createdAt: Number(event.created_at ?? 0),
+            };
+        }),
+        collaborators: (collaborators.results ?? []).map(person => ({
+            userId: person.user_id,
+            displayName: person.display_name,
+            username: person.username,
+            publicUserId: person.public_user_id ?? '',
+            platformRole: clientPlatformRole(person.platform_role),
+        })),
+    };
+}
+
+async function listSupportTicketsV73(request, env) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+    await cleanupExpiredSupportTicketTranscriptsV73(env);
+
+    const staff = isSupportTeamUserV73(auth.user);
+    const result = staff
+      ? await env.DB.prepare(`SELECT
+          t.*,
+          owner.display_name AS user_name,
+          owner.username AS username,
+          owner.public_user_id AS user_public_user_id,
+          owner.avatar_url AS user_avatar_url,
+          assignee.display_name AS assigned_name,
+          assignee.username AS assigned_username
+        FROM support_tickets t
+        JOIN users owner ON owner.id = t.user_id
+        LEFT JOIN users assignee ON assignee.id = t.assigned_to
+        ORDER BY t.last_activity_at DESC
+        LIMIT 500`).all()
+      : await env.DB.prepare(`SELECT
+          t.*,
+          owner.display_name AS user_name,
+          owner.username AS username,
+          owner.public_user_id AS user_public_user_id,
+          owner.avatar_url AS user_avatar_url,
+          assignee.display_name AS assigned_name,
+          assignee.username AS assigned_username
+        FROM support_tickets t
+        JOIN users owner ON owner.id = t.user_id
+        LEFT JOIN users assignee ON assignee.id = t.assigned_to
+        WHERE t.user_id = ?
+        ORDER BY t.last_activity_at DESC
+        LIMIT 100`).bind(auth.user.id).all();
+
+    return json((result.results ?? []).map(supportTicketPayloadV73));
+}
+
+async function getSupportTicketV73(request, env, ticketNumber) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+    const detail = await supportTicketDetailForUserV73(env, auth.user, ticketNumber);
+    if (!detail) return fail('Support ticket not found.', 404);
+    return json(detail);
+}
+
+async function createSupportTicketV73(request, env) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+    await enforceRateLimit(request, env, 'support-ticket-create-v73', 12, 1000 * 60 * 60, auth.user.id);
+
+    const body = await readJson(request);
+    const topic = String(body.topic ?? '').trim().slice(0, 120);
+    const messageBody = String(body.message ?? '').trim().slice(0, 2400);
+    if (topic.length < 2 || messageBody.length < 2) {
+        return fail('A topic and first message are required.');
+    }
+
+    const recipient = await supportTicketDefaultRecipientV73(env);
+    if (!recipient) return fail('Spaces Support is not available yet.', 503);
+
+    const now = Date.now();
+    const id = crypto.randomUUID();
+    const ticketNumber = await uniqueSupportTicketNumberV73(env);
+
+    await env.DB.prepare(`INSERT INTO support_tickets
+      (id, ticket_number, user_id, topic, status, assigned_to, created_at, updated_at,
+       resolved_at, resolved_by, last_activity_at, delete_after, reopened_at, transcript_deleted_at)
+      VALUES (?, ?, ?, ?, 'waiting', NULL, ?, ?, NULL, NULL, ?, NULL, NULL, NULL)`)
+      .bind(id, ticketNumber, auth.user.id, topic, now, now, now)
+      .run();
+
+    await env.DB.prepare(`INSERT INTO support_messages
+      (id, recipient_user_id, sender_user_id, case_id, subject, body, message_kind,
+       reply_to_message_id, created_at, read_at, ticket_id)
+      VALUES (?, ?, ?, NULL, ?, ?, 'reply', NULL, ?, NULL, ?)`)
+      .bind(
+        crypto.randomUUID(),
+        recipient.id,
+        auth.user.id,
+        topic,
+        messageBody,
+        now,
+        id,
+      )
+      .run();
+
+    await addSupportTicketEventV73(env, id, auth.user.id, 'created', { topic, ticketNumber });
+
+    const detail = await supportTicketDetailForUserV73(env, auth.user, ticketNumber);
+    return json(detail, 201);
+}
+
+async function reopenSupportTicketV73(request, env, ticketNumber) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+
+    const row = await supportTicketRowV73(env, ticketNumber);
+    if (!row || row.user_id !== auth.user.id) return fail('Support ticket not found.', 404);
+    if (row.status !== 'resolved') return fail('That ticket is already active.', 409);
+    if (row.transcript_deleted_at) return fail('That ticket can no longer be reopened. Start a new topic instead.', 409);
+    if (row.delete_after && Number(row.delete_after) <= Date.now()) {
+        return fail('That ticket has expired. Start a new topic instead.', 409);
+    }
+
+    const now = Date.now();
+    await env.DB.prepare(`UPDATE support_tickets
+      SET status = 'waiting',
+          assigned_to = NULL,
+          updated_at = ?,
+          resolved_at = NULL,
+          resolved_by = NULL,
+          last_activity_at = ?,
+          delete_after = NULL,
+          reopened_at = ?
+      WHERE id = ?`)
+      .bind(now, now, now, row.id)
+      .run();
+    await env.DB.prepare(`DELETE FROM support_ticket_collaborators WHERE ticket_id = ?`)
+      .bind(row.id)
+      .run();
+    await addSupportTicketEventV73(env, row.id, auth.user.id, 'reopened', { ticketNumber });
+
+    const detail = await supportTicketDetailForUserV73(env, auth.user, ticketNumber);
+    return json(detail);
+}
+
+async function sendSupportTicketMessageV73(request, env, ticketNumber) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+    await enforceRateLimit(request, env, 'support-ticket-message-v73', 120, 1000 * 60 * 60, auth.user.id);
+
+    const row = await supportTicketRowV73(env, ticketNumber);
+    if (!row) return fail('Support ticket not found.', 404);
+
+    const staff = isSupportTeamUserV73(auth.user);
+    if (!staff && row.user_id !== auth.user.id) return fail('Support ticket not found.', 404);
+    if (row.status === 'resolved') return fail('Choose Current Topic or New Topic before sending another message.', 409);
+    if (row.transcript_deleted_at) return fail('This ticket transcript was deleted. Start a new topic.', 409);
+
+    if (staff) {
+        const support = await requireSupportCapability(request, env, 'send_support_dms');
+        if ('response' in support) return support.response;
+    }
+
+    const body = await readJson(request);
+    const messageBody = String(body.body ?? '').trim().slice(0, 2400);
+    if (!messageBody) return fail('Write a message first.');
+
+    const now = Date.now();
+    let recipientUserId = row.user_id;
+    let messageKind = 'official';
+
+    if (!staff) {
+        const recipient = row.assigned_to
+          ? { id: row.assigned_to }
+          : await supportTicketDefaultRecipientV73(env);
+        if (!recipient?.id) return fail('Spaces Support is not available yet.', 503);
+        recipientUserId = recipient.id;
+        messageKind = 'reply';
+    } else if (!row.assigned_to) {
+        await env.DB.prepare(`UPDATE support_tickets
+          SET assigned_to = ?, status = 'taken', updated_at = ?
+          WHERE id = ?`)
+          .bind(auth.user.id, now, row.id)
+          .run();
+        await addSupportTicketEventV73(env, row.id, auth.user.id, 'taken', {
+            displayName: auth.user.display_name,
+        });
+    } else if (row.assigned_to !== auth.user.id) {
+        await env.DB.prepare(`INSERT OR IGNORE INTO support_ticket_collaborators
+          (ticket_id, user_id, added_by, added_at)
+          VALUES (?, ?, ?, ?)`)
+          .bind(row.id, auth.user.id, auth.user.id, now)
+          .run();
+    }
+
+    await env.DB.prepare(`INSERT INTO support_messages
+      (id, recipient_user_id, sender_user_id, case_id, subject, body, message_kind,
+       reply_to_message_id, created_at, read_at, ticket_id)
+      VALUES (?, ?, ?, NULL, ?, ?, ?, NULL, ?, NULL, ?)`)
+      .bind(
+        crypto.randomUUID(),
+        recipientUserId,
+        auth.user.id,
+        row.topic,
+        messageBody,
+        messageKind,
+        now,
+        row.id,
+      )
+      .run();
+
+    await env.DB.prepare(`UPDATE support_tickets
+      SET updated_at = ?, last_activity_at = ?
+      WHERE id = ?`)
+      .bind(now, now, row.id)
+      .run();
+
+    const detail = await supportTicketDetailForUserV73(env, auth.user, ticketNumber);
+    return json(detail);
+}
+
+async function resolveSupportTeamUserV73(env, queryValue) {
+    const clean = String(queryValue ?? '').trim().replace(/^[@#]/, '');
+    if (!clean) return null;
+    return env.DB.prepare(`SELECT id, display_name, username, public_user_id, platform_role
+      FROM users
+      WHERE platform_role IN ('creator', 'staff', 'support')
+        AND (id = ? OR public_user_id = ? OR username = ? COLLATE NOCASE)
+      ORDER BY CASE WHEN id = ? THEN 0 WHEN public_user_id = ? THEN 1 ELSE 2 END
+      LIMIT 1`)
+      .bind(clean, clean, clean, clean, clean)
+      .first();
+}
+
+async function updateSupportTicketV73(request, env, ticketNumber) {
+    const support = await requireSupportCapability(request, env, 'send_support_dms');
+    if ('response' in support) return support.response;
+
+    const row = await supportTicketRowV73(env, ticketNumber);
+    if (!row) return fail('Support ticket not found.', 404);
+
+    const body = await readJson(request);
+    const now = Date.now();
+    let status = row.status;
+    let assignedTo = row.assigned_to ?? null;
+    let topic = row.topic;
+    let resolvedAt = row.resolved_at ?? null;
+    let resolvedBy = row.resolved_by ?? null;
+    let deleteAfter = row.delete_after ?? null;
+    let reopenedAt = row.reopened_at ?? null;
+
+    if (body.take === true) {
+        assignedTo = support.user.id;
+        status = 'taken';
+        await addSupportTicketEventV73(env, row.id, support.user.id, 'taken', {
+            displayName: support.user.display_name,
+        });
+    }
+
+    if (body.assignToMe === true) {
+        assignedTo = support.user.id;
+        if (status === 'waiting') status = 'taken';
+        await addSupportTicketEventV73(env, row.id, support.user.id, 'assigned', {
+            displayName: support.user.display_name,
+            username: support.user.username,
+        });
+    }
+
+    if (body.assigneeQuery) {
+        const nextAssignee = await resolveSupportTeamUserV73(env, body.assigneeQuery);
+        if (!nextAssignee) return fail('That Staff or Support account was not found.', 404);
+        assignedTo = nextAssignee.id;
+        if (status === 'waiting') status = 'taken';
+        await addSupportTicketEventV73(env, row.id, support.user.id, 'assigned', {
+            displayName: nextAssignee.display_name,
+            username: nextAssignee.username,
+        });
+    }
+
+    if (body.unassign === true) {
+        assignedTo = null;
+        if (status !== 'resolved') status = 'waiting';
+        await addSupportTicketEventV73(env, row.id, support.user.id, 'unassigned', {});
+    }
+
+    if (body.topic !== undefined) {
+        const nextTopic = String(body.topic ?? '').trim().slice(0, 120);
+        if (nextTopic.length < 2) return fail('Ticket topic is too short.');
+        if (nextTopic !== topic) {
+            topic = nextTopic;
+            await addSupportTicketEventV73(env, row.id, support.user.id, 'topic_changed', {
+                topic: nextTopic,
+            });
+        }
+    }
+
+    if (body.status !== undefined) {
+        const nextStatus = String(body.status);
+        if (!SUPPORT_TICKET_STATUSES_V73.has(nextStatus)) return fail('Invalid ticket status.');
+        if (nextStatus === 'waiting' && row.transcript_deleted_at) {
+            return fail('A deleted ticket transcript cannot be reopened.', 409);
+        }
+
+        if (nextStatus === 'resolved' && row.status !== 'resolved') {
+            status = 'resolved';
+            resolvedAt = now;
+            resolvedBy = support.user.id;
+            deleteAfter = now + SUPPORT_TICKET_RETENTION_MS_V73;
+            await addSupportTicketEventV73(env, row.id, support.user.id, 'resolved', {
+                displayName: support.user.display_name,
+            });
+            await env.DB.prepare(`INSERT INTO support_messages
+              (id, recipient_user_id, sender_user_id, case_id, subject, body, message_kind,
+               reply_to_message_id, created_at, read_at, ticket_id)
+              VALUES (?, ?, ?, NULL, ?, ?, 'official', NULL, ?, NULL, ?)`)
+              .bind(
+                crypto.randomUUID(),
+                row.user_id,
+                support.user.id,
+                `Ticket ${row.ticket_number} resolved`,
+                `Ticket ${row.ticket_number} has been resolved by Spaces Support.`,
+                now,
+                row.id,
+              )
+              .run();
+        } else if (nextStatus !== 'resolved') {
+            if (row.status === 'resolved') {
+                resolvedAt = null;
+                resolvedBy = null;
+                deleteAfter = null;
+                reopenedAt = now;
+                if (nextStatus === 'waiting') assignedTo = null;
+                await addSupportTicketEventV73(env, row.id, support.user.id, 'reopened', {
+                    ticketNumber: row.ticket_number,
+                });
+            } else if (nextStatus !== status) {
+                await addSupportTicketEventV73(env, row.id, support.user.id, 'status_changed', {
+                    status: nextStatus,
+                });
+            }
+            status = nextStatus;
+        }
+    }
+
+    await env.DB.prepare(`UPDATE support_tickets
+      SET topic = ?,
+          status = ?,
+          assigned_to = ?,
+          updated_at = ?,
+          last_activity_at = ?,
+          resolved_at = ?,
+          resolved_by = ?,
+          delete_after = ?,
+          reopened_at = ?
+      WHERE id = ?`)
+      .bind(
+        topic,
+        status,
+        assignedTo,
+        now,
+        now,
+        resolvedAt,
+        resolvedBy,
+        deleteAfter,
+        reopenedAt,
+        row.id,
+      )
+      .run();
+
+    const detail = await supportTicketDetailForUserV73(env, support.user, ticketNumber);
+    return json(detail);
+}
+
+async function addSupportTicketCollaboratorV73(request, env, ticketNumber) {
+    const support = await requireSupportCapability(request, env, 'send_support_dms');
+    if ('response' in support) return support.response;
+
+    const row = await supportTicketRowV73(env, ticketNumber);
+    if (!row) return fail('Support ticket not found.', 404);
+
+    const body = await readJson(request);
+    const person = await resolveSupportTeamUserV73(env, body.userQuery);
+    if (!person) return fail('That Staff or Support account was not found.', 404);
+    if (person.id === row.assigned_to) {
+        const detail = await supportTicketDetailForUserV73(env, support.user, ticketNumber);
+        return json(detail);
+    }
+
+    const now = Date.now();
+    await env.DB.prepare(`INSERT OR IGNORE INTO support_ticket_collaborators
+      (ticket_id, user_id, added_by, added_at)
+      VALUES (?, ?, ?, ?)`)
+      .bind(row.id, person.id, support.user.id, now)
+      .run();
+    await addSupportTicketEventV73(env, row.id, support.user.id, 'collaborator_added', {
+        userId: person.id,
+        displayName: person.display_name,
+        username: person.username,
+    });
+
+    const detail = await supportTicketDetailForUserV73(env, support.user, ticketNumber);
+    return json(detail);
+}
+
+async function removeSupportTicketCollaboratorV73(request, env, ticketNumber, userId) {
+    const support = await requireSupportCapability(request, env, 'send_support_dms');
+    if ('response' in support) return support.response;
+
+    const row = await supportTicketRowV73(env, ticketNumber);
+    if (!row) return fail('Support ticket not found.', 404);
+
+    const person = await env.DB.prepare(`SELECT display_name, username
+      FROM users WHERE id = ? LIMIT 1`).bind(userId).first();
+
+    await env.DB.prepare(`DELETE FROM support_ticket_collaborators
+      WHERE ticket_id = ? AND user_id = ?`)
+      .bind(row.id, userId)
+      .run();
+
+    await addSupportTicketEventV73(env, row.id, support.user.id, 'collaborator_removed', {
+        userId,
+        displayName: person?.display_name ?? 'Team member',
+        username: person?.username ?? '',
+    });
+
+    const detail = await supportTicketDetailForUserV73(env, support.user, ticketNumber);
+    return json(detail);
+}
+
+async function deleteSupportTicketTranscriptV73(request, env, ticketNumber) {
+    const support = await requireSupportCapability(request, env, 'send_support_dms');
+    if ('response' in support) return support.response;
+
+    const row = await supportTicketRowV73(env, ticketNumber);
+    if (!row) return fail('Support ticket not found.', 404);
+
+    const now = Date.now();
+    await env.DB.prepare(`DELETE FROM support_messages WHERE ticket_id = ?`)
+      .bind(row.id)
+      .run();
+
+    await env.DB.prepare(`UPDATE support_tickets
+      SET status = 'resolved',
+          resolved_at = COALESCE(resolved_at, ?),
+          resolved_by = COALESCE(resolved_by, ?),
+          delete_after = COALESCE(delete_after, ?),
+          transcript_deleted_at = ?,
+          updated_at = ?,
+          last_activity_at = ?
+      WHERE id = ?`)
+      .bind(
+        now,
+        support.user.id,
+        now + SUPPORT_TICKET_RETENTION_MS_V73,
+        now,
+        now,
+        now,
+        row.id,
+      )
+      .run();
+
+    await addSupportTicketEventV73(env, row.id, support.user.id, 'closed', {
+        displayName: support.user.display_name,
+    });
+    await addSupportTicketEventV73(env, row.id, support.user.id, 'transcript_deleted', {});
+
+    await env.DB.prepare(`INSERT INTO support_messages
+      (id, recipient_user_id, sender_user_id, case_id, subject, body, message_kind,
+       reply_to_message_id, created_at, read_at, ticket_id)
+      VALUES (?, ?, ?, NULL, ?, ?, 'official', NULL, ?, NULL, NULL)`)
+      .bind(
+        crypto.randomUUID(),
+        row.user_id,
+        support.user.id,
+        `Ticket ${row.ticket_number} closed`,
+        `Ticket ${row.ticket_number} has been closed by Spaces Support.`,
+        now,
+      )
+      .run();
+
+    return new Response(null, { status: 204, headers: corsHeaders() });
 }
 
 async function listSupportMessages(request, env) {
@@ -10160,6 +11859,7 @@ async function listSupportInboxV53(request, env) {
     const markRead = url.searchParams.get('markRead') === '1';
     const now = Date.now();
     if (markRead) {
+      await upsertNotificationReadCursorV72(env, auth.user.id, 'support', 'support', now);
       await env.DB.prepare(`UPDATE support_messages SET read_at = COALESCE(read_at, ?) WHERE recipient_user_id = ? AND read_at IS NULL`)
         .bind(now, auth.user.id).run();
     }
@@ -10936,7 +12636,1075 @@ async function health(env) {
         time: Date.now(),
     });
 }
+// SPACES_V80_3_PARTNER_EMAIL_ARCHIVES_START
+// These APIs never derive authorization, sender identity or Partner status from
+// the public trust registry or from client-submitted role fields.
+const SPACES_V803_EMAIL_TEMPLATES = Object.freeze({
+  'ticket-reply': { sender: 'support', group: 'ticket', subject: 'Spaces Support — Update on ticket {{ticket.id}}', body: 'Hi {{user.displayName}},\n\nA Spaces Support agent replied to your ticket.\n\n{{ticket.reply}}\n\nView your ticket: {{support.url}}\n\n— Spaces Support' },
+  'ticket-created': { sender: 'support', group: 'ticket', subject: 'Spaces Support — Ticket {{ticket.id}} received', body: 'Hi {{user.displayName}},\n\nWe received your support request and created ticket {{ticket.id}}.\n\nCategory: {{ticket.category}}\n\nView ticket: {{support.url}}' },
+  'ticket-closed': { sender: 'support', group: 'ticket', subject: 'Spaces Support — Ticket {{ticket.id}} closed', body: 'Hi {{user.displayName}},\n\nTicket {{ticket.id}} has been closed.\n\nReason: {{ticket.closeReason}}\n\nIf you still need help, open a new request through Spaces Support.' },
+  'security-alert': { sender: 'security', group: 'founder', subject: 'Spaces Security — Account security alert', body: 'Hi {{user.displayName}},\n\nWe detected a security event on your account.\n\nEvent: {{security.event}}\nTime: {{security.time}}\nLocation/device: {{security.context}}\n\nIf this was not you, secure your account: {{security.url}}\n\nSpaces Security will never ask for your password or one-time code.' },
+  'moderation-action': { sender: 'support', group: 'moderation', subject: 'Spaces — Moderation notice for your account', body: 'Hi {{user.displayName}},\n\nA moderation action was applied to your account.\n\nAction: {{action.type}}\nReason: {{action.reason}}\nDuration: {{action.duration}}\nCase: {{case.id}}\n\nIf an appeal is available, contact Spaces Support: {{support.url}}' },
+  'partner-approved': { sender: 'support', group: 'partner', subject: 'Spaces Partners — {{space.name}} is now a Partner', body: 'Hi {{user.displayName}},\n\n{{space.name}} has been approved for the Spaces Partner Program.\n\nReview the Partner Code of Conduct: {{partner.codeUrl}}\n\nWelcome to the Spaces Partner community.' },
+  'partner-warning': { sender: 'support', group: 'partner', subject: 'Spaces Partners — Action required for {{space.name}}', body: 'Hi {{user.displayName}},\n\nYour Partner Space {{space.name}} needs attention.\n\nIssue: {{partner.issue}}\nRequired action: {{partner.action}}\nDeadline: {{partner.deadline}}\n\nPartner policies: {{partner.policyUrl}}' },
+  'partner-removed': { sender: 'support', group: 'partner', subject: 'Spaces Partners — Partner status update for {{space.name}}', body: 'Hi {{user.displayName}},\n\nPartner status for {{space.name}} has been removed.\n\nReason: {{partner.reason}}\n\nContact Spaces Support if an appeal is available: {{support.url}}' },
+  'partner-application': { sender: 'support', group: 'partner', subject: 'Spaces Partners — Application received', body: 'Hi {{user.displayName}},\n\nWe received your Partner Program application for {{space.name}}.\n\nApplication: {{application.id}}\n\nOur team will review the application.' },
+  'beta-invite': { sender: 'noreply', group: 'founder', subject: 'Spaces Beta — You are invited', body: 'Hi {{user.displayName}},\n\nYou have been invited to the Spaces beta.\n\nStart here: {{beta.url}}\n\nReview the Beta Program Terms: {{beta.termsUrl}}' },
+});
+
+function spacesV803Short(value, limit = 240) {
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f]/gu, ' ').trim().slice(0, limit);
+}
+function spacesV803Escape(value) {
+  return String(value ?? '').replace(/[&<>"']/gu, character => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[character]);
+}
+function spacesV803Render(template, variables) {
+  return template.replace(/\{\{([a-zA-Z0-9.]+)\}\}/gu, (_, name) => String(variables[name] ?? ''));
+}
+function spacesV803EmailConfigured(env) {
+  return Boolean(env.EMAIL && typeof env.EMAIL.send === 'function' && validEmail(String(env.SPACES_EMAIL_FROM ?? '')));
+}
+function spacesV803Sender(env, sender) {
+  const fallback = normalizeEmail(env.SPACES_EMAIL_FROM);
+  if (!validEmail(fallback)) throw new ApiRequestError('Email sender is not configured.', 503);
+  const key = { support:'SPACES_EMAIL_SUPPORT_FROM', noreply:'SPACES_EMAIL_NOREPLY_FROM', security:'SPACES_EMAIL_SECURITY_FROM' }[sender];
+  const candidate = normalizeEmail(env[key] || fallback);
+  if (!validEmail(candidate) || candidate.split('@')[1] !== fallback.split('@')[1]) {
+    throw new ApiRequestError('Email sender must be an approved address on the Spaces domain.', 503);
+  }
+  return candidate;
+}
+function spacesV803ImageUrl(value, env) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  let parsed;
+  try { parsed = new URL(raw); } catch { throw new ApiRequestError('Invalid email image URL.', 400); }
+  const allowedHosts = new Set(['yourspaces.net', 'www.yourspaces.net',
+    ...String(env.SPACES_EMAIL_IMAGE_HOSTS ?? '').split(',').map(host => host.trim().toLowerCase()).filter(Boolean)]);
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password || !allowedHosts.has(parsed.hostname.toLowerCase()) || raw.length > 600) {
+    throw new ApiRequestError('Email images must use an approved HTTPS host.', 400);
+  }
+  return parsed.href;
+}
+function spacesV803EmailHtml(subject, text, heroUrl, footerUrl, replyTo) {
+  const image = (url, alt) => url ? `<img src="${spacesV803Escape(url)}" alt="${alt}" width="580" style="display:block;max-width:100%;height:auto;margin:18px auto;border:0">` : '';
+  const lines = spacesV803Escape(text).replace(/\n/gu, '<br>');
+  return `<!doctype html><html><body style="margin:0;background:#09080d;color:#f4f1f7;font-family:Arial,sans-serif"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:24px 10px"><tr><td align="center"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:620px;background:#141019;border:1px solid #32283b;border-radius:16px"><tr><td style="padding:25px 30px;background:#21182b;font-weight:800;font-size:20px;letter-spacing:.14em">◈ SPACES</td></tr><tr><td style="padding:28px 30px"><h1 style="font-size:22px;line-height:1.3;margin:0 0 22px;color:#faf6fc">${spacesV803Escape(subject)}</h1>${image(heroUrl,'Spaces announcement')}<div style="font-size:14px;line-height:1.75;color:#d8cfe0">${lines}</div>${image(footerUrl,'Spaces footer')}</td></tr><tr><td style="padding:17px 30px;border-top:1px solid #32283b;font-size:11px;color:#a69ab0">Spaces · ${spacesV803Escape(replyTo)}<br>Spaces Support will never ask for passwords or verification codes.</td></tr></table></td></tr></table></body></html>`;
+}
+function spacesV803PublicTrust(row) {
+  return { classification: row.classification, verified: Boolean(row.verified), featured: Boolean(row.featured), beta: Boolean(row.beta), staffOwned: Boolean(row.staff_owned) };
+}
+async function spacesV803PartnerPublic(request, env, spaceId = '') {
+  if (spaceId) {
+    const row = await env.DB.prepare(`SELECT classification,verified,featured,beta,staff_owned FROM partner_space_status_v80 WHERE space_id=? LIMIT 1`).bind(spaceId).first();
+    return json({ spaceId, ...(row ? spacesV803PublicTrust(row) : { classification:'community', verified:false, featured:false, beta:false, staffOwned:false }) });
+  }
+  const rows = await env.DB.prepare(`SELECT space_id,classification,verified,featured,beta,staff_owned FROM partner_space_status_v80 WHERE classification<>'community' OR verified=1 OR featured=1 OR beta=1 OR staff_owned=1 LIMIT 2000`).all();
+  const spaces = {};
+  for (const row of rows.results ?? []) spaces[row.space_id] = spacesV803PublicTrust(row);
+  return json({ version: 1, spaces });
+}
+async function spacesV803PartnerApplications(request, env) {
+  const auth = await requireUser(request, env);
+  if ('response' in auth) return auth.response;
+  if (request.method === 'GET') {
+    const rows = await env.DB.prepare(`SELECT a.id,a.space_id,a.status,a.message,a.updated_at,s.name AS space_name FROM partner_program_applications_v80 a JOIN spaces s ON s.id=a.space_id WHERE a.applicant_user_id=? ORDER BY a.updated_at DESC LIMIT 100`).bind(auth.user.id).all();
+    return json({ applications: (rows.results ?? []).map(row => ({ id:row.id,spaceId:row.space_id,spaceName:row.space_name,status:row.status,message:row.message,updatedAt:Number(row.updated_at) })) });
+  }
+  await enforceRateLimit(request, env, 'partner-apply-v80', 5, 24*60*60*1000, auth.user.id);
+  const body = await readJson(request);
+  const spaceId = spacesV803Short(body.spaceId, 128);
+  const message = spacesV803Short(body.message, 1800);
+  if (!spaceId || message.length < 20) return fail('Choose a Space and describe your Partner application (at least 20 characters).', 400);
+  const space = await env.DB.prepare(`SELECT id,owner_user_id FROM spaces WHERE id=? LIMIT 1`).bind(spaceId).first();
+  if (!space || space.owner_user_id !== auth.user.id) return fail('Only the Space owner can apply.', 403);
+  const prior = await env.DB.prepare(`SELECT id,status FROM partner_program_applications_v80 WHERE space_id=?`).bind(spaceId).first();
+  if (prior && ['pending','approved'].includes(prior.status)) return fail('This Space already has an active Partner application.', 409);
+  const now = Date.now();
+  const id = prior?.id ?? crypto.randomUUID();
+  await env.DB.batch([
+    env.DB.prepare(`INSERT INTO partner_program_applications_v80 (id,space_id,applicant_user_id,status,message,created_at,updated_at) VALUES (?,?,?,'pending',?,?,?) ON CONFLICT(space_id) DO UPDATE SET status='pending',message=excluded.message,applicant_user_id=excluded.applicant_user_id,reviewer_user_id=NULL,review_note='',reviewed_at=NULL,updated_at=excluded.updated_at`).bind(id,spaceId,auth.user.id,message,now,now),
+    env.DB.prepare(`INSERT INTO partner_program_events_v80 (id,space_id,actor_user_id,event_type,note,created_at) VALUES (?,?,?,'applied',?,?)`).bind(crypto.randomUUID(),spaceId,auth.user.id,message.slice(0,600),now),
+  ]);
+  return json({ applied:true, applicationId:id, spaceId, status:'pending' }, 201);
+}
+async function spacesV803PartnerStaff(request, env) {
+  const auth = await requireSupportConsole(request, env);
+  if ('response' in auth) return auth.response;
+  if (!['creator','staff'].includes(auth.user.platform_role)) return fail('Staff or Founder role required for Partner decisions.', 403);
+  if (request.method === 'GET') {
+    const status = new URL(request.url).searchParams.get('status') ?? '';
+    if (status && !['pending','approved','denied','revoked'].includes(status)) return fail('Invalid Partner status.', 400);
+    const result = await env.DB.prepare(`SELECT a.id,a.space_id,a.applicant_user_id,a.status,a.message,a.review_note,a.updated_at,s.name AS space_name,s.owner_user_id,u.display_name AS owner_name FROM partner_program_applications_v80 a JOIN spaces s ON s.id=a.space_id JOIN users u ON u.id=s.owner_user_id WHERE (?='' OR a.status=?) ORDER BY a.updated_at DESC LIMIT 200`).bind(status,status).all();
+    return json({ canReview:true, applications:(result.results ?? []).map(row => ({ id:row.id,spaceId:row.space_id,spaceName:row.space_name,ownerId:row.owner_user_id,ownerName:row.owner_name,status:row.status,message:row.message,reviewNote:row.review_note,updatedAt:Number(row.updated_at) })) });
+  }
+  await enforceRateLimit(request, env, 'partner-review-v80', 40, 60*60*1000, auth.user.id);
+  const body = await readJson(request);
+  const spaceId = spacesV803Short(body.spaceId, 128);
+  const action = spacesV803Short(body.action, 20);
+  const note = spacesV803Short(body.note, 1000);
+  if (!spaceId || !['approve','deny','revoke'].includes(action)) return fail('Valid Space ID and Partner action required.', 400);
+  if (action !== 'approve' && note.length < 8) return fail('Provide a reason for this Partner decision.', 400);
+  const space = await env.DB.prepare(`SELECT s.id,s.name,s.owner_user_id,u.platform_role AS owner_role FROM spaces s JOIN users u ON u.id=s.owner_user_id WHERE s.id=? LIMIT 1`).bind(spaceId).first();
+  if (!space) return fail('Space not found.', 404);
+  if (body.ownerId && String(body.ownerId) !== space.owner_user_id) return fail('Space owner changed; refresh the review.', 409);
+  if (auth.user.platform_role !== 'creator' && auth.user.id === space.owner_user_id) return fail('Staff cannot approve their own Space.', 403);
+  if (action === 'approve') {
+    if (await activeSupportRestrictionV77(env,'space',spaceId,'join_space')) return fail('Resolve the active Space restriction before Partner approval.', 409);
+    if (await activePlatformBan(env,space.owner_user_id)) return fail('Space owner has an active platform ban.', 409);
+  }
+  const prior = await env.DB.prepare(`SELECT id,status,created_at,applicant_user_id FROM partner_program_applications_v80 WHERE space_id=?`).bind(spaceId).first();
+  const previousTrust = await env.DB.prepare(`SELECT classification FROM partner_space_status_v80 WHERE space_id=?`).bind(spaceId).first();
+  if (action === 'revoke' && previousTrust?.classification !== 'partner') return fail('Space is not an active Partner.', 409);
+  if (action === 'deny' && previousTrust?.classification === 'partner') return fail('Revoke Partner status instead of denying an active Partner.', 409);
+  if (action === 'approve' && previousTrust?.classification === 'partner') return fail('This Space is already a Partner.', 409);
+  if (action === 'approve' && previousTrust?.classification === 'official') return fail('Official Space status must be managed separately by the Founder.', 409);
+  const status = {approve:'approved',deny:'denied',revoke:'revoked'}[action];
+  const now = Date.now();
+  const nextClass = action === 'approve' ? 'partner' : 'community';
+  const auditId = crypto.randomUUID();
+  const statements = [
+    env.DB.prepare(`INSERT INTO partner_program_applications_v80 (id,space_id,applicant_user_id,status,message,reviewer_user_id,review_note,created_at,updated_at,reviewed_at) VALUES (?,?,?,?,'',?,?,?, ?,?) ON CONFLICT(space_id) DO UPDATE SET status=excluded.status,reviewer_user_id=excluded.reviewer_user_id,review_note=excluded.review_note,updated_at=excluded.updated_at,reviewed_at=excluded.reviewed_at`).bind(prior?.id ?? crypto.randomUUID(),spaceId,prior?.applicant_user_id ?? space.owner_user_id,status,auth.user.id,note,prior?.created_at ?? now,now,now),
+    env.DB.prepare(`INSERT INTO partner_space_status_v80 (space_id,classification,verified,featured,beta,staff_owned,approved_by,approved_at,updated_at) VALUES (?,?,0,0,0,0,?,?,?) ON CONFLICT(space_id) DO UPDATE SET classification=excluded.classification,verified=CASE WHEN excluded.classification='community' THEN 0 ELSE partner_space_status_v80.verified END,featured=CASE WHEN excluded.classification='community' THEN 0 ELSE partner_space_status_v80.featured END,approved_by=excluded.approved_by,approved_at=excluded.approved_at,updated_at=excluded.updated_at`).bind(spaceId,nextClass,action==='approve'?auth.user.id:null,action==='approve'?now:null,now),
+    env.DB.prepare(`INSERT INTO partner_program_events_v80 (id,space_id,actor_user_id,event_type,note,created_at) VALUES (?,?,?,?,?,?)`).bind(crypto.randomUUID(),spaceId,auth.user.id,status,note,now),
+    env.DB.prepare(`INSERT INTO support_audit_v77 (id,actor_id,actor_role,action,target_type,target_id,case_id,reason_category,note,before_json,after_json,expires_at,created_at) VALUES (?,?,?,?,?,?,NULL,'Partner Program',?,?,?,NULL,?)`).bind(auditId,auth.user.id,auth.user.platform_role,`partner.${action}`,'space',spaceId,note,JSON.stringify({status:prior?.status ?? null,classification:previousTrust?.classification ?? 'community'}),JSON.stringify({status,classification:nextClass}),now),
+  ];
+  await env.DB.batch(statements);
+  return json({ approved:action==='approve',spaceId,spaceName:space.name,status,classification:nextClass,auditId });
+}
+async function spacesV803EmailCapabilities(request, env) {
+  const auth = await requireSupportConsole(request, env);
+  if ('response' in auth) return auth.response;
+  const permissions = await supportPermissionsForUserV48(env, auth.user);
+  let migrationReady = false;
+  try { await env.DB.prepare(`SELECT id FROM support_email_deliveries_v80 LIMIT 1`).first(); migrationReady = true; } catch {}
+  const canSend = permissions.includes('send_support_dms') && spacesV803EmailConfigured(env) && migrationReady;
+  return json({ canSend, migrationReady, senderNames:canSend ? {support:'Spaces Support',noreply:'Spaces',security:'Spaces Security'} : {}, requiresAuthorization:true });
+}
+async function spacesV803ResolveTicket(env, ticketId) {
+  if (!ticketId) return null;
+  const v77 = await env.DB.prepare(`SELECT id,case_number,reporter_id,target_user_id,target_space_id,status,case_type FROM support_cases_v77 WHERE id=? OR case_number=? LIMIT 1`).bind(ticketId,ticketId).first();
+  if (v77) return { id:v77.id,displayId:v77.case_number,recipientId:v77.reporter_id,status:v77.status,spaceId:v77.target_space_id,kind:'v77',targetUserId:v77.target_user_id,caseType:v77.case_type };
+  const legacy = await env.DB.prepare(`SELECT id,ticket_number,user_id,status FROM support_tickets WHERE id=? OR ticket_number=? LIMIT 1`).bind(ticketId,ticketId).first();
+  if (legacy) return { id:legacy.id,displayId:legacy.ticket_number,recipientId:legacy.user_id,status:legacy.status,spaceId:null,kind:'v73',targetUserId:null,caseType:'request' };
+  return null;
+}
+async function spacesV803EmailSend(request, env) {
+  const auth = await requireSupportCapability(request, env, 'send_support_dms');
+  if ('response' in auth) return auth.response;
+  if (!spacesV803EmailConfigured(env)) return fail('Cloudflare Email Service or Spaces sender is not configured.', 503);
+  await enforceRateLimit(request, env, 'support-email-v80', 20, 60*60*1000, auth.user.id);
+  const body = await readJson(request);
+  const templateId = spacesV803Short(body.templateId, 60);
+  const template = SPACES_V803_EMAIL_TEMPLATES[templateId];
+  if (!template) return fail('Unapproved email template.', 400);
+  const founder = auth.user.platform_role === 'creator';
+  const staff = founder || auth.user.platform_role === 'staff';
+  if (template.group === 'founder' && !founder) return fail('Founder approval required for this email type.', 403);
+  if (['partner','moderation'].includes(template.group) && !staff) return fail('Staff or Founder role required for this email type.', 403);
+  const ticketId = spacesV803Short(body.ticketId, 128);
+  const ticket = await spacesV803ResolveTicket(env,ticketId);
+  if (ticketId && !ticket) return fail('Ticket or case not found.', 404);
+  if (template.group === 'ticket' && !ticket) return fail('Select an existing Support ticket.', 400);
+  if (templateId === 'ticket-closed' && !['resolved','archived'].includes(ticket.status)) return fail('Close or resolve the ticket before sending this email.', 409);
+  const explicitId = spacesV803Short(body.userId, 128);
+  let recipientId = explicitId || (templateId === 'moderation-action' ? ticket?.targetUserId : ticket?.recipientId);
+  if (!recipientId) return fail('Select a recipient or ticket.', 400);
+  let recipient = await env.DB.prepare(`SELECT id,display_name,email,email_verified FROM users WHERE id=? OR public_user_id=? LIMIT 1`).bind(recipientId,recipientId).first();
+  if (!recipient) return fail('Recipient not found.', 404);
+  recipientId = recipient.id;
+  if (ticket && (templateId === 'moderation-action' ? ticket.targetUserId !== recipientId : ticket.recipientId !== recipientId)) return fail('Ticket does not belong to the selected recipient.', 403);
+  if (!staff && (!ticket || ticket.recipientId !== recipientId)) return fail('Support can only email the member associated with a ticket.', 403);
+  if (!recipient.email_verified || !validEmail(recipient.email)) return fail('Recipient needs a verified email address.', 409);
+  if (templateId === 'moderation-action') {
+    if (!ticket || ticket.kind !== 'v77' || !ticket.targetUserId || !['resolved','archived'].includes(ticket.status)) return fail('Select a resolved case with a moderation target.', 400);
+    const action = await env.DB.prepare(`SELECT id FROM support_audit_v77 WHERE case_id=? AND action LIKE 'restriction.%' LIMIT 1`).bind(ticket.id).first();
+    if (!action) return fail('Record a moderation action on this case before sending a notice.', 409);
+  }
+  if (templateId === 'beta-invite') {
+    const invite = await env.DB.prepare(`SELECT id FROM beta_access WHERE email=? COLLATE NOCASE AND status IN ('invited','claimed') LIMIT 1`).bind(recipient.email).first();
+    if (!invite) return fail('This member does not have a recorded beta invitation.', 409);
+  }
+  let space = null;
+  let application = null;
+  let trust = null;
+  if (template.group === 'partner') {
+    const requestedSpaceId = spacesV803Short(body.spaceId,128) || ticket?.spaceId || '';
+    if (requestedSpaceId) space = await env.DB.prepare(`SELECT id,name,owner_user_id FROM spaces WHERE id=? LIMIT 1`).bind(requestedSpaceId).first();
+    if (!space) {
+      const hint = spacesV803Short(body.variables?.['space.name'],120);
+      if (hint) space = await env.DB.prepare(`SELECT id,name,owner_user_id FROM spaces WHERE owner_user_id=? AND name=? COLLATE NOCASE LIMIT 1`).bind(recipientId,hint).first();
+      else {
+        const all = await env.DB.prepare(`SELECT id,name,owner_user_id FROM spaces WHERE owner_user_id=? LIMIT 2`).bind(recipientId).all();
+        if ((all.results ?? []).length === 1) space = all.results[0];
+      }
+    }
+    if (!space || space.owner_user_id !== recipientId) return fail('Select a Space owned by the email recipient.', 403);
+    application = await env.DB.prepare(`SELECT id,status,review_note FROM partner_program_applications_v80 WHERE space_id=?`).bind(space.id).first();
+    trust = await env.DB.prepare(`SELECT classification FROM partner_space_status_v80 WHERE space_id=?`).bind(space.id).first();
+    if (['partner-approved','partner-warning'].includes(templateId) && trust?.classification !== 'partner') return fail('The Space is not an approved Partner.', 409);
+    if (templateId === 'partner-removed' && application?.status !== 'revoked') return fail('Partner removal must be recorded before this notice.', 409);
+    if (templateId === 'partner-application' && application?.status !== 'pending') return fail('No pending Partner application exists.', 409);
+  }
+  const raw = body.variables && typeof body.variables === 'object' && !Array.isArray(body.variables) ? body.variables : {};
+  const safe = (key,limit=350) => spacesV803Short(raw[key],limit);
+  const site = 'https://yourspaces.net';
+  const variables = {
+    'user.displayName':spacesV803Short(recipient.display_name,100),
+    'ticket.id':ticket?.displayId ?? '',
+    'ticket.reply':String(raw['ticket.reply'] ?? '').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/gu,' ').trim().slice(0,2000),
+    'ticket.category':ticket?.caseType ?? 'Support',
+    'ticket.closeReason':safe('ticket.closeReason',350) || 'Resolved',
+    'case.id':ticket?.displayId ?? '',
+    'action.type':safe('action.type',150),
+    'action.reason':safe('action.reason',500),
+    'action.duration':safe('action.duration',100),
+    'security.event':safe('security.event',250),
+    'security.time':new Date().toISOString(),
+    'security.context':safe('security.context',250),
+    'space.name':space?.name ?? '',
+    'partner.issue':safe('partner.issue',350),
+    'partner.action':safe('partner.action',350),
+    'partner.deadline':safe('partner.deadline',100),
+    'partner.reason':application?.review_note || 'Partner status changed',
+    'application.id':application?.id ?? '',
+    'support.url':`${site}/support`,
+    'security.url':`${site}/security`,
+    'partner.codeUrl':`${site}/partner/code-of-conduct/`,
+    'partner.policyUrl':`${site}/partner/`,
+    'beta.url':`${site}/beta`,
+    'beta.termsUrl':`${site}/tos/beta/`,
+  };
+  if (templateId === 'ticket-reply' && variables['ticket.reply'].length < 3) return fail('Write a Support reply first.', 400);
+  if (templateId === 'partner-warning' && (!variables['partner.issue'] || !variables['partner.action'])) return fail('Partner warning needs an issue and required action.', 400);
+  if (templateId === 'moderation-action' && (!variables['action.type'] || !variables['action.reason'])) return fail('Moderation notice needs an action and reason.', 400);
+  if (templateId === 'security-alert' && !variables['security.event']) return fail('Security alert needs an event description.', 400);
+  const image = body.image && typeof body.image === 'object' ? body.image : {};
+  const heroUrl = spacesV803ImageUrl(image.heroUrl, env);
+  const footerUrl = spacesV803ImageUrl(image.footerUrl, env);
+  const subject = spacesV803Render(template.subject, variables).slice(0,180);
+  const text = spacesV803Render(template.body, variables).slice(0,5000);
+  const from = spacesV803Sender(env, template.sender);
+  const replyTo = validEmail(String(env.SPACES_EMAIL_REPLY_TO ?? '')) ? String(env.SPACES_EMAIL_REPLY_TO) : from;
+  const dedupeInput = `${auth.user.id}|${recipientId}|${templateId}|${ticket?.id ?? space?.id ?? ''}|${Math.floor(Date.now()/60000)}`;
+  const dedupeKey = await sha256Base64(dedupeInput);
+  const now = Date.now();
+  const deliveryId = crypto.randomUUID();
+  const claim = await env.DB.prepare(`INSERT OR IGNORE INTO support_email_deliveries_v80 (id,actor_user_id,recipient_user_id,ticket_id,template_id,sender_address,dedupe_key,status,created_at) VALUES (?,?,?,?,?,?,?,'sending',?)`).bind(deliveryId,auth.user.id,recipientId,ticket?.id ?? null,templateId,from,dedupeKey,now).run();
+  if (Number(claim?.meta?.changes ?? 0) !== 1) return fail('A matching email was already requested recently.', 409);
+  try {
+    const provider = await env.EMAIL.send({ to:{email:recipient.email,name:recipient.display_name}, from:{email:from,name:template.sender==='security'?'Spaces Security':template.sender==='support'?'Spaces Support':'Spaces'}, replyTo, subject, text, html:spacesV803EmailHtml(subject,text,heroUrl,footerUrl,replyTo) });
+    await env.DB.prepare(`UPDATE support_email_deliveries_v80 SET status='sent',provider_message_id=?,completed_at=? WHERE id=?`).bind(String(provider?.messageId ?? ''),Date.now(),deliveryId).run();
+    return json({ sent:true, deliveryId, providerMessageId:provider?.messageId ?? null });
+  } catch (caught) {
+    await env.DB.prepare(`UPDATE support_email_deliveries_v80 SET status='failed',error_code=?,completed_at=? WHERE id=?`).bind(spacesV803Short(caught?.code ?? 'SEND_FAILED',80),Date.now(),deliveryId).run();
+    console.error('Spaces V80 Support email provider rejected send.', caught?.code ?? 'SEND_FAILED');
+    return fail('Email provider rejected delivery. Check Email Service configuration.', 502);
+  }
+}
+async function spacesV803MemberArchives(request, env, caseId = '') {
+  const auth = await requireUser(request, env);
+  if ('response' in auth) return auth.response;
+  if (request.method === 'GET') {
+    const rows = await env.DB.prepare(`SELECT c.id,c.case_number,c.subject,c.status,c.case_type,c.last_activity_at,a.archived_at FROM support_member_case_archives_v80 a JOIN support_cases_v77 c ON c.id=a.case_id WHERE a.user_id=? AND c.reporter_id=? ORDER BY a.archived_at DESC LIMIT 200`).bind(auth.user.id,auth.user.id).all();
+    return json({ archives:(rows.results ?? []).map(row => ({ id:row.id,caseNumber:row.case_number,subject:row.subject,status:row.status,caseType:row.case_type,lastActivityAt:Number(row.last_activity_at),archivedAt:Number(row.archived_at) })) });
+  }
+  const row = await env.DB.prepare(`SELECT id,reporter_id FROM support_cases_v77 WHERE id=? LIMIT 1`).bind(caseId).first();
+  if (!row || row.reporter_id !== auth.user.id) return fail('Support case not found.', 404);
+  const body = await readJson(request);
+  if (typeof body.archived !== 'boolean') return fail('archived must be true or false.', 400);
+  const now = Date.now();
+  if (body.archived) await env.DB.prepare(`INSERT INTO support_member_case_archives_v80 (case_id,user_id,archived_at) VALUES (?,?,?) ON CONFLICT(case_id,user_id) DO NOTHING`).bind(caseId,auth.user.id,now).run();
+  else await env.DB.prepare(`DELETE FROM support_member_case_archives_v80 WHERE case_id=? AND user_id=?`).bind(caseId,auth.user.id).run();
+  return json({ caseId, archived:body.archived });
+}
+async function spacesV803ArchiveHealth(request, env) {
+  const auth = await requireSupportCapability(request, env, 'view_reports');
+  if ('response' in auth) return auth.response;
+  const cases = await env.DB.prepare(`SELECT status,COUNT(*) AS count FROM support_cases_v77 GROUP BY status`).all();
+  const memberArchives = await env.DB.prepare(`SELECT COUNT(*) AS count FROM support_member_case_archives_v80`).first();
+  const legacy = await env.DB.prepare(`SELECT status,COUNT(*) AS count FROM support_tickets GROUP BY status`).all();
+  return json({ v77:Object.fromEntries((cases.results ?? []).map(row => [row.status,Number(row.count)])), legacyTickets:Object.fromEntries((legacy.results ?? []).map(row => [row.status,Number(row.count)])), memberArchiveCount:Number(memberArchives?.count ?? 0), note:'Counts are diagnostic only. Verify archive, restore, reopen and delete with real test accounts.' });
+}
+// SPACES_V80_3_PARTNER_EMAIL_ARCHIVES_END
+
+// SPACES_V81_2_DM_SIGNALING_START
+// Only accepted DM participants can signal. All payloads are size/type checked.
+const SPACES_V81_RING_MS = 90_000;
+const SPACES_V81_ACTIVE_MS = 2 * 60 * 60 * 1000;
+const SPACES_V81_END_GRACE_MS = 60_000;
+
+async function spacesV812VoiceAccess(request, env) {
+  const auth = await requireUser(request, env);
+  if ('response' in auth) return auth;
+  return auth;
+}
+async function spacesV812VoiceAllowed(env, row, userId) {
+  const conversation = await directConversationForUser(env, row.conversation_id, userId);
+  if (!conversation || conversation.status !== 'accepted') return false;
+  return !(await accountBlockExists(env, row.caller_user_id, row.callee_user_id));
+}
+async function spacesV812VoiceCall(request, env, callId, operation) {
+  const auth = await spacesV812VoiceAccess(request, env);
+  if ('response' in auth) return auth.response;
+  if (!/^[a-f0-9]{32}$/u.test(callId)) return fail('Call not found.', 404);
+  await finalizeExpiredDmCallsV85(env);
+  const row = await env.DB.prepare(`SELECT * FROM voice_dm_calls_v81 WHERE id=? LIMIT 1`).bind(callId).first();
+  const now = Date.now();
+  if (!row || (row.caller_user_id !== auth.user.id && row.callee_user_id !== auth.user.id)) return fail('Call not found.', 404);
+  if (!await spacesV812VoiceAllowed(env,row,auth.user.id)) return fail('Call unavailable.', 403);
+  if (operation === 'read') {
+    if (row.expires_at < now && row.status !== 'ended') return json({status:'ended',signals:[],lastSeq:0});
+    const url = new URL(request.url);
+    const after = Number(url.searchParams.get('after') ?? 0);
+    if (!Number.isSafeInteger(after) || after < 0) return fail('Invalid cursor.',400);
+    const records = await env.DB.prepare(`SELECT id,kind,payload,created_at FROM voice_dm_signals_v81 WHERE call_id=? AND target_user_id=? AND id>? ORDER BY id ASC LIMIT 100`).bind(callId,auth.user.id,after).all();
+    const signals = (records.results ?? []).map(item => ({seq:item.id,signal:{callId,type:item.kind,...(item.payload?JSON.parse(item.payload):{})},createdAt:item.created_at}));
+    return json({status:row.expires_at < now?'ended':row.status,signals,lastSeq:signals.length?signals[signals.length-1].seq:after});
+  }
+  if (row.status === 'ended' || row.expires_at < now) return fail('Call has ended.',409);
+  const body = await readJson(request);
+  const kind = String(body?.type ?? '');
+  if (!['offer','answer','ice','decline','hangup'].includes(kind)) return fail('Invalid signal type.',400);
+  if (kind === 'offer' && (auth.user.id !== row.caller_user_id || row.status !== 'ringing')) return fail('Only the caller can offer.',403);
+  if (kind === 'answer' && (auth.user.id !== row.callee_user_id || row.status !== 'ringing')) return fail('Only the recipient can answer.',403);
+  if (kind === 'decline' && auth.user.id !== row.callee_user_id) return fail('Only the recipient can decline.',403);
+  if (kind === 'ice') {
+    const count = await env.DB.prepare(`SELECT COUNT(*) AS n FROM voice_dm_signals_v81 WHERE call_id=? AND sender_user_id=? AND kind='ice'`).bind(callId,auth.user.id).first();
+    if (Number(count?.n??0)>=120) return fail('Too many ICE candidates.',429);
+    const offer = await env.DB.prepare(`SELECT id FROM voice_dm_signals_v81 WHERE call_id=? AND kind='offer' LIMIT 1`).bind(callId).first();
+    if (!offer) return fail('Call offer is not ready.',409);
+  }
+  if (kind === 'answer') {
+    const offer = await env.DB.prepare(`SELECT id FROM voice_dm_signals_v81 WHERE call_id=? AND kind='offer' LIMIT 1`).bind(callId).first();
+    if (!offer) return fail('Call offer is not ready.',409);
+  }
+  if (kind === 'offer' || kind === 'answer') {
+    const existing = await env.DB.prepare(`SELECT id FROM voice_dm_signals_v81 WHERE call_id=? AND kind=? LIMIT 1`).bind(callId,kind).first();
+    if (existing) return fail('Session description already submitted.',409);
+    if (!body.description || body.description.type !== kind || typeof body.description.sdp !== 'string' || body.description.sdp.length < 10 || body.description.sdp.length > 20_000) return fail('Invalid SDP description.',400);
+  }
+  if (kind === 'ice' && (!body.candidate || typeof body.candidate.candidate !== 'string' || body.candidate.candidate.length > 2048 || JSON.stringify(body.candidate).length > 3000)) return fail('Invalid ICE candidate.',400);
+  const payload = kind === 'offer' || kind === 'answer' ? JSON.stringify({description:{type:kind,sdp:body.description.sdp}}) : kind === 'ice' ? JSON.stringify({candidate:body.candidate}) : null;
+  const other = auth.user.id === row.caller_user_id ? row.callee_user_id : row.caller_user_id;
+  await env.DB.prepare(`INSERT INTO voice_dm_signals_v81(call_id,sender_user_id,target_user_id,kind,payload,created_at) VALUES(?,?,?,?,?,?)`).bind(callId,auth.user.id,other,kind,payload,now).run();
+  const ended = kind === 'decline' || kind === 'hangup';
+  const active = kind === 'answer' || row.status === 'active';
+  await env.DB.prepare(`UPDATE voice_dm_calls_v81 SET status=?,updated_at=?,expires_at=? WHERE id=?`).bind(ended?'ended':active?'active':'ringing',now,ended?now+SPACES_V81_END_GRACE_MS:active?now+SPACES_V81_ACTIVE_MS:row.expires_at,callId).run();
+  if (kind === 'answer') await env.DB.prepare('UPDATE voice_dm_calls_v81 SET connected_at = COALESCE(connected_at,?) WHERE id=?').bind(now,callId).run();
+  if (ended) await finishDmCallV85(env,row,kind,now);
+  return json({ok:true,status:ended?'ended':active?'active':'ringing'});
+}
+async function spacesV812VoiceCreate(request,env) {
+  const auth = await spacesV812VoiceAccess(request,env);
+  if ('response' in auth) return auth.response;
+  const body = await readJson(request);
+  const conversationId = typeof body?.conversationId === 'string' ? body.conversationId : '';
+  if (!/^[a-zA-Z0-9_-]{3,128}$/u.test(conversationId)) return fail('Invalid conversation.',400);
+  const conversation = await directConversationForUser(env,conversationId,auth.user.id);
+  if (!conversation || conversation.status !== 'accepted') return fail('An accepted DM is required.',403);
+  const other = conversation.user_low_id === auth.user.id ? conversation.user_high_id : conversation.user_low_id;
+  if (await accountBlockExists(env,auth.user.id,other)) return fail('Calling is unavailable for this conversation.',403);
+  const restriction = auth.user.platform_role === 'creator' ? null : (await activeSupportRestrictionV77(env,'user',auth.user.id,'direct_messages'));
+  if (restriction) return fail('Direct calls are restricted for this account.',403);
+  const now = Date.now();
+  // Retain ended/expired signaling briefly for the peer, then prune on call creation.
+  await env.DB.prepare(`DELETE FROM voice_dm_calls_v81 WHERE expires_at<?`).bind(now-24*60*60*1000).run();
+  const count = await env.DB.prepare(`SELECT COUNT(*) AS n FROM voice_dm_calls_v81 WHERE caller_user_id=? AND created_at>?`).bind(auth.user.id,now-15*60_000).first();
+  if (Number(count?.n??0)>=8) return fail('Too many calls. Please wait before calling again.',429);
+  const busy = await env.DB.prepare(`SELECT id FROM voice_dm_calls_v81 WHERE status IN ('ringing','active') AND expires_at>? AND (caller_user_id IN (?,?) OR callee_user_id IN (?,?)) LIMIT 1`).bind(now,auth.user.id,other,auth.user.id,other).first();
+  if (busy) return fail('One of you is already in a call.',409);
+  const id = crypto.randomUUID().replace(/-/gu,'');
+  await env.DB.prepare(`INSERT INTO voice_dm_calls_v81(id,conversation_id,caller_user_id,callee_user_id,status,created_at,updated_at,expires_at) VALUES(?,?,?,?,'ringing',?,?,?)`).bind(id,conversationId,auth.user.id,other,now,now,now+SPACES_V81_RING_MS).run();
+  return json({callId:id,conversationId,status:'ringing',expiresAt:now+SPACES_V81_RING_MS},201);
+}
+async function spacesV812VoiceInbox(request,env) {
+  const auth = await spacesV812VoiceAccess(request,env);
+  if ('response' in auth) return auth.response;
+  const now=Date.now();
+  await finalizeExpiredDmCallsV85(env,now);
+  const rows=await env.DB.prepare(`SELECT * FROM voice_dm_calls_v81 WHERE status IN ('ringing','active') AND expires_at>? AND (caller_user_id=? OR callee_user_id=?) ORDER BY created_at DESC LIMIT 5`).bind(now,auth.user.id,auth.user.id).all();
+  const calls=[];
+  for(const row of rows.results??[]){
+    if(!await spacesV812VoiceAllowed(env,row,auth.user.id))continue;
+    const otherId=auth.user.id===row.caller_user_id?row.callee_user_id:row.caller_user_id;
+    const other=await env.DB.prepare(`SELECT id,display_name,username FROM users WHERE id=? LIMIT 1`).bind(otherId).first();
+    if(!other)continue;
+    calls.push({callId:row.id,conversationId:row.conversation_id,direction:auth.user.id===row.caller_user_id?'outgoing':'incoming',status:row.status,person:{id:other.id,displayName:other.display_name,username:other.username},createdAt:row.created_at,expiresAt:row.expires_at});
+  }
+  return json({calls});
+}
+async function spacesV812VoiceIce(request,env){
+  const auth=await spacesV812VoiceAccess(request,env);
+  if('response' in auth)return auth.response;
+  const servers=[{urls:['stun:stun.l.google.com:19302']}];
+  const urls=String(env.VOICE_TURN_URLS??'').split(',').map(s=>s.trim()).filter(s=>/^turns?:[^\s]+$/u.test(s)).slice(0,4);
+  if(urls.length && env.VOICE_TURN_SECRET){
+    const expires=Math.floor(Date.now()/1000)+600;
+    const username=`${expires}:spaces-${auth.user.id}`;
+    const key=await crypto.subtle.importKey('raw',encoder.encode(String(env.VOICE_TURN_SECRET)),{name:'HMAC',hash:'SHA-1'},false,['sign']);
+    const sig=await crypto.subtle.sign('HMAC',key,encoder.encode(username));
+    const credential=btoa(String.fromCharCode(...new Uint8Array(sig)));
+    servers.push({urls,username,credential});
+  }
+  return json({iceServers:servers,turnConfigured:servers.length>1});
+}
+// SPACES_V81_2_DM_SIGNALING_END
+
+
+// SPACES_V83_BROADCAST_API: authenticated, persisted across web, desktop and Android.
+function broadcastV83AsClient(row) {
+    return {
+        id: row.id, format: row.format, title: row.title, body: row.body,
+        imageUrl: row.image_url || null, actionLabel: row.action_label || null,
+        actionUrl: row.action_url || null, publishedAt: Number(row.published_at),
+        published: Boolean(row.published), expiresAt: row.expires_at === null ? null : Number(row.expires_at),
+    };
+}
+function broadcastV83Writer(user) {
+    return user && (user.platform_role === 'creator' || user.platform_role === 'staff');
+}
+async function broadcastV83RequireWriter(request, env) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth;
+    if (!broadcastV83Writer(auth.user)) return { response: fail('Spaces platform Staff or Founder access is required.', 403) };
+    return auth;
+}
+function broadcastV83Https(raw) {
+    if (typeof raw !== 'string' || !raw.trim()) return null;
+    try {
+        const u = new URL(raw.trim());
+        if (u.protocol !== 'https:' || u.username || u.password || raw.length > 1200) return null;
+        return u.toString();
+    } catch { return null; }
+}
+async function broadcastV83ListActive(request, env) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+    const now = Date.now();
+    const result = await env.DB.prepare(`SELECT b.* FROM platform_broadcasts_v83 b
+       LEFT JOIN platform_broadcast_receipts_v83 r ON r.broadcast_id = b.id AND r.user_id = ?
+       WHERE b.published = 1 AND b.published_at <= ? AND (b.expires_at IS NULL OR b.expires_at > ?)
+       AND r.broadcast_id IS NULL
+       ORDER BY b.published_at DESC LIMIT 12`).bind(auth.user.id, now, now).all();
+    const distinct = new Set();
+    const broadcasts = [];
+    for (const row of result.results || []) {
+        if (distinct.has(row.format)) continue;
+        distinct.add(row.format);
+        broadcasts.push(broadcastV83AsClient(row));
+    }
+    return json({ broadcasts });
+}
+async function broadcastV83Dismiss(request, env, id) {
+    const auth = await requireUser(request, env);
+    if ('response' in auth) return auth.response;
+    if (!/^[0-9a-f-]{36}$/i.test(id)) return fail('Invalid broadcast ID.', 400);
+    const exists = await env.DB.prepare('SELECT id FROM platform_broadcasts_v83 WHERE id = ?').bind(id).first();
+    if (!exists) return fail('Broadcast not found.', 404);
+    await env.DB.prepare(`INSERT OR IGNORE INTO platform_broadcast_receipts_v83(user_id, broadcast_id, dismissed_at)
+      VALUES (?, ?, ?)`).bind(auth.user.id, id, Date.now()).run();
+    return json({ dismissed: true });
+}
+async function broadcastV83ListStaff(request, env) {
+    const auth = await broadcastV83RequireWriter(request, env);
+    if ('response' in auth) return auth.response;
+    const result = await env.DB.prepare(`SELECT * FROM platform_broadcasts_v83
+      ORDER BY created_at DESC LIMIT 60`).all();
+    return json({ broadcasts: (result.results || []).map(broadcastV83AsClient) });
+}
+async function broadcastV83Publish(request, env) {
+    const auth = await broadcastV83RequireWriter(request, env);
+    if ('response' in auth) return auth.response;
+    const value = await readJson(request);
+    const format = String(value?.format || '');
+    const title = String(value?.title || '').trim();
+    const body = String(value?.body || '').trim();
+    const imageInput = String(value?.imageUrl || '').trim();
+    const actionInput = String(value?.actionUrl || '').trim();
+    const actionLabel = String(value?.actionLabel || '').trim();
+    if (!['banner', 'modal'].includes(format)) return fail('Select a banner or popup announcement.');
+    if (title.length < 2 || title.length > 120) return fail('Title must contain 2–120 characters.');
+    if (body.length > 4000) return fail('Description cannot exceed 4000 characters.');
+    if (format === 'banner' && body.length > 220) return fail('Top banner description must be 220 characters or fewer.');
+    if (imageInput && !broadcastV83Https(imageInput)) return fail('Images must use a valid HTTPS URL.');
+    if (actionInput && (!broadcastV83Https(actionInput) || !actionLabel)) return fail('Link needs a secure HTTPS URL and button label.');
+    if (actionLabel.length > 50) return fail('Button label must be 50 characters or fewer.');
+    if (format === 'banner' && imageInput) return fail('Images are only available in popup announcements.');
+    const now = Date.now(), id = crypto.randomUUID();
+    // Only one active announcement of each format: no stack of old popups.
+    await env.DB.batch([
+        env.DB.prepare('UPDATE platform_broadcasts_v83 SET published = 0 WHERE format = ? AND published = 1').bind(format),
+        env.DB.prepare(`INSERT INTO platform_broadcasts_v83
+           (id,format,title,body,image_url,action_label,action_url,published,created_by,created_at,published_at,expires_at)
+           VALUES (?,?,?,?,?,?,?,1,?,?,?,NULL)`).bind(id, format, title, body, imageInput || null, actionLabel || null, actionInput || null, auth.user.id, now, now),
+    ]);
+    return json({ broadcast: { id, format, title, body, imageUrl: imageInput || null, actionLabel: actionLabel || null, actionUrl: actionInput || null, published: true, publishedAt: now } }, 201);
+}
+async function broadcastV83Unpublish(request, env, id) {
+    const auth = await broadcastV83RequireWriter(request, env);
+    if ('response' in auth) return auth.response;
+    if (!/^[0-9a-f-]{36}$/i.test(id)) return fail('Invalid broadcast ID.');
+    const result = await env.DB.prepare('UPDATE platform_broadcasts_v83 SET published = 0 WHERE id = ?').bind(id).run();
+    return json({ unpublished: Number(result.meta?.changes || 0) > 0 });
+}
+async function broadcastV83UploadImage(request, env) {
+    const auth = await broadcastV83RequireWriter(request, env);
+    if ('response' in auth) return auth.response;
+    if (!env.DESKTOP_RELEASES) return fail('Broadcast image storage is not configured.', 503);
+    const contentType = (request.headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase();
+    const suffix = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[contentType];
+    if (!suffix) return fail('Upload a PNG, JPEG or WebP image.', 415);
+    const claimed = Number(request.headers.get('Content-Length') || 0);
+    if (claimed > 1024 * 1024) return fail('Image must be at most 1 MB.', 413);
+    const data = new Uint8Array(await request.arrayBuffer());
+    if (data.byteLength < 12 || data.byteLength > 1024 * 1024) return fail('Image must be 1 MB or smaller.', 413);
+    const isPng = data[0]===137 && data[1]===80 && data[2]===78 && data[3]===71;
+    const isJpeg = data[0]===255 && data[1]===216 && data[2]===255;
+    const isWebp = String.fromCharCode(...data.slice(0,4))==='RIFF' && String.fromCharCode(...data.slice(8,12))==='WEBP';
+    if (!(suffix === 'png' && isPng || suffix === 'jpg' && isJpeg || suffix === 'webp' && isWebp)) return fail('Image content does not match its type.', 415);
+    const name = `${crypto.randomUUID()}.${suffix}`;
+    await env.DESKTOP_RELEASES.put(`broadcast/images/${name}`, data, { httpMetadata: { contentType } });
+    return json({ imageUrl: `https://spaces.spagotei.workers.dev/v1/broadcast-images/${name}` }, 201);
+}
+async function broadcastV83GetImage(env, filename, method) {
+    if (!/^[0-9a-f-]{36}\.(?:png|jpg|webp)$/i.test(filename)) return fail('Not found.',404);
+    if (!env.DESKTOP_RELEASES) return fail('Not found.',404);
+    const object = await env.DESKTOP_RELEASES.get(`broadcast/images/${filename}`);
+    if (!object) return fail('Not found.',404);
+    const h = new Headers(corsHeaders());
+    h.set('Content-Type', object.httpMetadata?.contentType || 'image/png');
+    h.set('Cache-Control', 'public, max-age=604800, immutable');
+    h.set('X-Content-Type-Options','nosniff');
+    return new Response(method === 'HEAD' ? null : object.body, { status: 200, headers: h });
+}
+
+
+// SPACES_V84_EMAIL_STUDIO_API: verified-account one-to-one email, staff access, safe formatted HTML.
+// Sender is decided entirely by the server; client cannot submit arbitrary From headers.
+const spacesV84SenderAddresses = Object.freeze({
+  noreply: 'noreply@yourspaces.net',
+  support: 'support@yourspaces.net',
+  hello: 'hello@yourspaces.net',
+  security: 'security@yourspaces.net',
+});
+function spacesV84Error(message, status = 400) { return fail(message, status); }
+function spacesV84Escape(s) {
+  return String(s ?? '').replace(/[&<>"']/gu, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function spacesV84Plain(s, max) { return String(s ?? '').replace(/[\u0000-\u001f\u007f]/gu, ' ').trim().slice(0,max); }
+function spacesV84Sender(env, key, user) {
+  const names = {support:'Spaces Support',hello:'Spaces',noreply:'Spaces Notifications',security:'Spaces Security'};
+  if (!Object.hasOwn(spacesV84SenderAddresses,key)) throw new Error('Unknown email sender.');
+  if (key === 'security' && user.platform_role !== 'creator') throw new Error('Security sender is Founder-only.');
+  const addr = spacesV84SenderAddresses[key];
+  const root = String(env.SPACES_EMAIL_FROM || '');
+  if (!validEmail(root) || root.toLowerCase().split('@')[1] !== 'yourspaces.net') throw new Error('Verified Spaces email domain is not configured.');
+  if (!env.EMAIL || typeof env.EMAIL.send !== 'function') throw new Error('Cloudflare email sending is not configured.');
+  return { email:addr, name:names[key] };
+}
+async function spacesV84Access(request, env) {
+  const auth = await spacesV924EmailAccess(request, env, 'view');
+  if ('response' in auth) return auth;
+  if (!['creator','staff'].includes(auth.user.platform_role)) return {response:spacesV84Error('Custom email is restricted to Founder and platform Staff.',403)};
+  return auth;
+}
+function spacesV84Url(value) {
+  try { const u = new URL(value); if (u.protocol !== 'https:' || u.username || u.password || value.length > 1200) return null; return u.href; }
+  catch { return null; }
+}
+function spacesV84Inline(input) {
+  const s = String(input ?? '');
+  const regex = /\[color=(#[0-9a-fA-F]{6})\]([^\n]*?)\[\/color\]|\[bg=(#[0-9a-fA-F]{6})\]([^\n]*?)\[\/bg\]|\[([^\]\n]{1,100})\]\((https:\/\/[^\s)]+)\)|\*\*([^*\n]+)\*\*|__([^_\n]+)__|~~([^~\n]+)~~|\*([^*\n]+)\*|`([^`\n]+)`/gu;
+  let out = '', cursor = 0, found;
+  while ((found = regex.exec(s))) {
+    out += spacesV84Escape(s.slice(cursor,found.index));
+    if (found[1]) out += `<span style="color:${found[1]}">${spacesV84Escape(found[2])}</span>`;
+    else if (found[3]) out += `<span style="background-color:${found[3]};padding:1px 3px;border-radius:3px">${spacesV84Escape(found[4])}</span>`;
+    else if (found[5]) {
+      const url = spacesV84Url(found[6]);
+      out += url ? `<a href="${spacesV84Escape(url)}" style="color:#c6a4ff;text-decoration:underline">${spacesV84Escape(found[5])}</a>` : spacesV84Escape(found[0]);
+    }
+    else if (found[7]) out += `<strong>${spacesV84Escape(found[7])}</strong>`;
+    else if (found[8]) out += `<u>${spacesV84Escape(found[8])}</u>`;
+    else if (found[9]) out += `<s>${spacesV84Escape(found[9])}</s>`;
+    else if (found[10]) out += `<em>${spacesV84Escape(found[10])}</em>`;
+    else if (found[11]) out += `<code style="font-family:monospace;background:#f0eaf7;padding:2px 4px;border-radius:4px">${spacesV84Escape(found[11])}</code>`;
+    cursor = regex.lastIndex;
+  }
+  return out + spacesV84Escape(s.slice(cursor));
+}
+function spacesV84RichBody(body) {
+  const lines = String(body ?? '').replace(/\r\n?/gu,'\n').split('\n');
+  const out=[]; let list=[]; let ordered = false;
+  const flush = () => { if(list.length){out.push(`<${ordered?'ol':'ul'} style="margin:8px 0 16px;padding-left:24px">${list.join('')}</${ordered?'ol':'ul'}>`);list=[];} };
+  for (const line of lines) {
+    if (/^\s*$/.test(line)) { flush();out.push('<div style="height:11px"></div>');continue; }
+    const bullet = line.match(/^\s{0,3}([-*]|\d+\.)\s+(.+)$/u);
+    if(bullet){const nextOrdered=/\d/.test(bullet[1]);if(list.length && ordered!==nextOrdered)flush();ordered=nextOrdered;list.push(`<li style="margin:4px 0">${spacesV84Inline(bullet[2])}</li>`);continue;}
+    flush();
+    const h=line.match(/^(#{1,3})\s+(.+)$/u);
+    if(h){const level=h[1].length;out.push(`<h${level} style="margin:12px 0 8px;color:#17121f;font-family:Arial,sans-serif;font-size:${level===1?28:level===2?22:18}px;line-height:1.3">${spacesV84Inline(h[2])}</h${level}>`);continue;}
+    if(/^\s*---+\s*$/.test(line)){out.push('<hr style="border:0;border-top:1px solid #e8e2ee;margin:17px 0">');continue;}
+    if(/^>\s?/.test(line)){out.push(`<blockquote style="margin:10px 0;padding:10px 14px;border-left:3px solid #ac85dd;background:#f6f1fa;color:#4a3e54">${spacesV84Inline(line.replace(/^>\s?/,''))}</blockquote>`);continue;}
+    out.push(`<p style="margin:0;line-height:1.7">${spacesV84Inline(line)}</p>`);
+  }
+  flush();return out.join('\n');
+}
+function spacesV84Html(title,subject,body,bannerUrl,replyTo) {
+  const header = bannerUrl ? `<img src="${spacesV84Escape(bannerUrl)}" width="600" alt="Spaces" style="display:block;width:100%;max-width:600px;height:auto;border:0">` : `<div style="background:linear-gradient(120deg,#221832,#684c8c);padding:37px 34px;color:#f8f4ff;font:700 30px Arial,sans-serif">Spaces</div>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${spacesV84Escape(subject)}</title></head><body style="margin:0;padding:30px 10px;background:#f3f0f6;color:#30283a;font-family:Arial,Helvetica,sans-serif"><table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 auto;width:100%;max-width:600px;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden"><tr><td>${header}</td></tr><tr><td style="padding:32px 36px 35px"><div style="color:#8360ad;font-size:11px;font-weight:700;letter-spacing:2px;margin-bottom:12px">SPACES OFFICIAL MESSAGE</div><h1 style="color:#17121f;font-size:25px;line-height:1.25;margin:0 0 20px">${spacesV84Escape(title||subject)}</h1><div style="color:#342c3f;font-size:15px;line-height:1.7">${spacesV84RichBody(body)}</div></td></tr><tr><td style="padding:23px 36px;background:#f8f5fb;color:#786c82;font-size:11px;line-height:1.7">Sent by Spaces. Questions? Reply to <a href="mailto:${spacesV84Escape(replyTo)}" style="color:#694a92">${spacesV84Escape(replyTo)}</a>.<br>Never share your password or verification codes over email.</td></tr></table></body></html>`;
+}
+function spacesV84Payload(raw) {
+  const body=String(raw?.body ?? '').replace(/\r\n?/gu,'\n').trim();
+  const subject=spacesV84Plain(raw?.subject,180);
+  const heading=spacesV84Plain(raw?.heading,120);
+  if (!subject || subject.length < 3 || subject.length > 180) throw new Error('Subject must be 3–180 characters.');
+  if (body.length < 3 || body.length > 8000) throw new Error('Message must be 3–8000 characters.');
+  const sender=String(raw?.sender ?? 'support');
+  if(!Object.hasOwn(spacesV84SenderAddresses,sender)) throw new Error('Unsupported sender address.');
+  const bannerId=String(raw?.bannerId ?? '');
+  if(bannerId && !/^[0-9a-f-]{36}\.(?:png|jpg|webp)$/i.test(bannerId)) throw new Error('Select an uploaded banner from Spaces.');
+  return {subject,heading,body,sender,bannerId};
+}
+const spacesV84BannerPrefix='mail/banners/';
+const spacesV84ImageBase='https://spaces.spagotei.workers.dev/v1/mail-images/';
+async function spacesV84EnsureBanner(env, bannerId) {
+  if (!bannerId) return '';
+  if (!env.DESKTOP_RELEASES) throw new Error('Email banner storage is unavailable.');
+  const asset=await env.DESKTOP_RELEASES.head(spacesV84BannerPrefix+bannerId);
+  if(!asset) throw new Error('Selected banner could not be found.');
+  return spacesV84ImageBase+bannerId;
+}
+async function spacesV84Preview(request,env) {
+  const auth=await spacesV84Access(request,env);if('response'in auth)return auth.response;
+  try {
+    const item=spacesV84Payload(await readJson(request));
+    spacesV84Sender(env,item.sender,auth.user);
+    const banner=await spacesV84EnsureBanner(env,item.bannerId);
+    return json({html:spacesV84Html(item.heading,item.subject,item.body,banner,'support@yourspaces.net')});
+  } catch(e){return spacesV84Error(e.message,400)}
+}
+async function spacesV84Capabilities(request,env) {
+  const auth=await spacesV84Access(request,env);if('response'in auth)return auth.response;
+  return json({canSend:Boolean(env.EMAIL&&typeof env.EMAIL.send==='function'),senders:auth.user.platform_role==='creator'?['support','hello','noreply','security']:['support','hello','noreply'],requiresVerifiedMember:true,maxRecipients:20,audiences:[{id:"selected",label:"Selected members"},{id:"platform_staff",label:"Platform Staff and Support"},{id:"beta_members",label:"Claimed beta members"}]});
+}
+async function spacesV84ListBanners(request,env) {
+  const auth=await spacesV84Access(request,env);if('response'in auth)return auth.response;
+  if(!env.DESKTOP_RELEASES)return spacesV84Error('Email image storage unavailable.',503);
+  const objects=await env.DESKTOP_RELEASES.list({prefix:spacesV84BannerPrefix,limit:100});
+  return json({banners:(objects.objects||[]).filter(obj=>/^[0-9a-f-]{36}\.(?:png|jpg|webp)$/i.test(obj.key.slice(spacesV84BannerPrefix.length))).map(obj=>({id:obj.key.slice(spacesV84BannerPrefix.length),url:spacesV84ImageBase+obj.key.slice(spacesV84BannerPrefix.length),createdAt:obj.uploaded?.getTime?.()||0})).reverse()});
+}
+async function spacesV84UploadBanner(request,env) {
+  const auth=await spacesV84Access(request,env);if('response'in auth)return auth.response;
+  if(!env.DESKTOP_RELEASES)return spacesV84Error('Email image storage unavailable.',503);
+  await enforceRateLimit(request,env,'staff-email-asset-v84',15,60*60*1000,auth.user.id);
+  const type=(request.headers.get('Content-Type')||'').split(';')[0].toLowerCase();
+  const ext=({'image/png':'png','image/jpeg':'jpg','image/webp':'webp'})[type];
+  if(!ext)return spacesV84Error('Choose a PNG, JPEG or WebP banner.',415);
+  if(Number(request.headers.get('Content-Length')||0)>1536*1024)return spacesV84Error('Banner cannot exceed 1.5 MB.',413);
+  const data=new Uint8Array(await request.arrayBuffer());
+  if(data.length<12||data.length>1536*1024)return spacesV84Error('Banner cannot exceed 1.5 MB.',413);
+  const png=data[0]===137&&data[1]===80&&data[2]===78&&data[3]===71;
+  const jpg=data[0]===255&&data[1]===216&&data[2]===255;
+  const webp=String.fromCharCode(...data.slice(0,4))==='RIFF'&&String.fromCharCode(...data.slice(8,12))==='WEBP';
+  if(!(ext==='png'&&png||ext==='jpg'&&jpg||ext==='webp'&&webp))return spacesV84Error('Image bytes do not match upload type.',415);
+  const id=crypto.randomUUID()+'.'+ext;
+  await env.DESKTOP_RELEASES.put(spacesV84BannerPrefix+id,data,{httpMetadata:{contentType:type}});
+  return json({banner:{id,url:spacesV84ImageBase+id,createdAt:Date.now()}},201);
+}
+async function spacesV84GetBanner(env,id,method) {
+  if(!/^[0-9a-f-]{36}\.(?:png|jpg|webp)$/i.test(id)||!env.DESKTOP_RELEASES)return spacesV84Error('Not found.',404);
+  const obj=await env.DESKTOP_RELEASES.get(spacesV84BannerPrefix+id);
+  if(!obj)return spacesV84Error('Not found.',404);
+  const headers=new Headers(corsHeaders());
+  headers.set('Content-Type',obj.httpMetadata?.contentType||'image/png');
+  headers.set('X-Content-Type-Options','nosniff');
+  headers.set('Cache-Control','public,max-age=86400');
+  return new Response(method==='HEAD'?null:obj.body,{status:200,headers});
+}
+async function spacesV84History(request,env) {
+  const auth=await spacesV84Access(request,env);if('response'in auth)return auth.response;
+  const result=await env.DB.prepare('SELECT id,recipient_email,sender_address,subject,status,created_at,completed_at,campaign_id FROM platform_email_deliveries_v84 WHERE actor_user_id=? ORDER BY created_at DESC LIMIT 80').bind(auth.user.id).all();
+  return json({deliveries:(result.results||[]).map(r=>({id:r.id,recipientEmail:r.recipient_email,sender:r.sender_address,subject:r.subject,status:r.status,campaignId:r.campaign_id,createdAt:Number(r.created_at),completedAt:r.completed_at?Number(r.completed_at):null}))});
+}
+// Audiences are resolved on the server. Never accept recipient addresses from client-side preview data.
+const spacesV84MaxRecipients = 20;
+async function spacesV84ResolveAudience(env, audience, selected, actorId='') {
+  const rows=[];
+  if (audience === 'self') {
+    const own=await env.DB.prepare('SELECT id,email,email_verified,display_name FROM users WHERE id=? LIMIT 1').bind(actorId).first();
+    if(!own || !Number(own.email_verified) || !validEmail(own.email))throw Error('Your own Spaces account must have a verified email to send a test.');
+    rows.push(own);
+  } else if (audience === 'selected') {
+    const values=String(selected||'').split(/[\r\n,;]+/u).map(v=>v.trim()).filter(Boolean);
+    const unique=[...new Set(values.map(v=>v.toLowerCase()))];
+    if (!unique.length || unique.length>spacesV84MaxRecipients) throw Error('Select 1–20 Spaces members (separate emails or user IDs with commas or new lines).');
+    for (const value of unique) {
+      if (value.length>254) throw Error('A recipient entry is too long.');
+      const row=await env.DB.prepare('SELECT id,email,email_verified,display_name FROM users WHERE email=? COLLATE NOCASE OR public_user_id=? OR id=? LIMIT 1').bind(value,value,value).first();
+      if(!row || !Number(row.email_verified) || !validEmail(row.email)) throw Error('Each recipient must have a verified Spaces account: '+value);
+      rows.push(row);
+    }
+  } else if (audience === 'platform_staff') {
+    const result=await env.DB.prepare("SELECT id,email,email_verified,display_name FROM users WHERE email_verified=1 AND platform_role IN ('creator','staff','support') ORDER BY id ASC LIMIT 21").all();
+    rows.push(...(result.results||[]));
+  } else if (audience === 'beta_members') {
+    const result=await env.DB.prepare("SELECT DISTINCT u.id,u.email,u.email_verified,u.display_name FROM users u JOIN beta_access b ON b.user_id=u.id AND b.status='claimed' WHERE u.email_verified=1 ORDER BY u.id ASC LIMIT 21").all();
+    rows.push(...(result.results||[]));
+  } else throw Error('Invalid audience.');
+  if(rows.length>spacesV84MaxRecipients) throw Error('This group exceeds the safe 20-recipient limit. Use a smaller selected list; automated batch queues can be added in a future release.');
+  const unique=new Map();for(const row of rows)if(row?.id && validEmail(row.email))unique.set(row.id,row);
+  const eligible=[];let optedOut=0;
+  for(const row of unique.values()) {
+    const pref=await env.DB.prepare('SELECT opted_out FROM platform_email_preferences_v84 WHERE user_id=?').bind(row.id).first();
+    if(Number(pref?.opted_out||0)){optedOut++;continue;}
+    eligible.push(row);
+  }
+  return {eligible,optedOut};
+}
+async function spacesV84AudiencePreview(request,env) {
+  const auth=await spacesV84Access(request,env);if('response'in auth)return auth.response;
+  try {
+    const raw=await readJson(request);
+    const audience=String(raw?.audience||'selected');
+    const selection=String(raw?.recipient||'');
+    const result=await spacesV84ResolveAudience(env,audience,selection,auth.user.id);
+    return json({audience,count:result.eligible.length,excluded:result.optedOut,recipients:result.eligible.map(row=>({name:row.display_name,email:row.email}))});
+  } catch(e){return spacesV84Error(e.message,400);}
+}
+async function spacesV84GetOrCreateUnsub(env,userId) {
+  const existing=await env.DB.prepare('SELECT token FROM platform_email_preferences_v84 WHERE user_id=?').bind(userId).first();
+  if(existing?.token)return existing.token;
+  const token=crypto.randomUUID()+crypto.randomUUID().replace(/-/g,'');
+  await env.DB.prepare('INSERT OR IGNORE INTO platform_email_preferences_v84(user_id,token,opted_out,updated_at) VALUES(?,?,0,?)').bind(userId,token,Date.now()).run();
+  const fresh=await env.DB.prepare('SELECT token FROM platform_email_preferences_v84 WHERE user_id=?').bind(userId).first();
+  return fresh?.token||token;
+}
+async function spacesV84Unsubscribe(request,env,token) {
+  if(!/^[a-f0-9-]{68}$/i.test(token))return new Response('Invalid link.',{status:400,headers:{'Content-Type':'text/plain'}});
+  const row=await env.DB.prepare('SELECT user_id FROM platform_email_preferences_v84 WHERE token=?').bind(token).first();
+  if(!row)return new Response('Link not found.',{status:404,headers:{'Content-Type':'text/plain'}});
+  if(request.method==='POST') {
+    await env.DB.prepare('UPDATE platform_email_preferences_v84 SET opted_out=1,updated_at=? WHERE user_id=?').bind(Date.now(),row.user_id).run();
+  }
+  const done=request.method==='POST';
+  return new Response(`<!doctype html><html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Spaces email preferences</title><body style="font:16px system-ui;background:#100e17;color:white;display:grid;place-items:center;min-height:80vh"><main style="padding:30px;max-width:440px"><h1>Spaces</h1><p>${done?'You have unsubscribed from nonessential Spaces staff emails.':'Stop receiving nonessential Spaces staff emails? Account security emails may still be delivered.'}</p>${done?'':'<form method="post"><button style="padding:12px 20px;border:0;border-radius:10px;cursor:pointer">Unsubscribe</button></form>'}</main></body></html>`,{status:200,headers:{'Content-Type':'text/html;charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'}});
+}
+async function spacesV84Send(request,env) {
+  const auth=await spacesV924EmailAccess(request,env,'send');if('response'in auth)return auth.response;
+  if(!env.EMAIL||typeof env.EMAIL.send!=='function')return spacesV84Error('Spaces email sending is not configured.',503);
+  try {
+    await enforceRateLimit(request,env,'staff-composed-email-v84',4,60*60*1000,auth.user.id);
+    const raw=await readJson(request);
+    const payload=spacesV84Payload(raw);
+    const sender=spacesV84Sender(env,payload.sender,auth.user);
+    const bannerUrl=await spacesV84EnsureBanner(env,payload.bannerId);
+    const audience=raw?.testOnly===true?'self':String(raw?.audience||'selected');
+    const resolved=await spacesV84ResolveAudience(env,audience,raw?.recipient,auth.user.id);
+    const recipients=resolved.eligible;
+    if(!recipients.length)return spacesV84Error('No eligible, subscribed recipients in this audience.',409);
+    if(Number(raw?.confirmedCount)!==recipients.length)return spacesV84Error('Audience changed since preview. Review recipients and confirm again.',409);
+    const sendId=String(raw?.sendId||'');
+    if(!/^[0-9a-f-]{36}$/i.test(sendId))return spacesV84Error('Invalid send confirmation.',400);
+    const now=Date.now();
+    const campaignId=crypto.randomUUID();
+    const claim=await env.DB.prepare("INSERT OR IGNORE INTO platform_email_campaigns_v84(id,actor_user_id,audience,recipient_count,subject,send_id,created_at) VALUES (?,?,?,?,?,?,?)").bind(campaignId,auth.user.id,audience,recipients.length,payload.subject,sendId,now).run();
+    if(Number(claim?.meta?.changes||0)!==1)return spacesV84Error('This campaign has already been submitted. Check sent history.',409);
+    const replyTo=validEmail(String(env.SPACES_EMAIL_REPLY_TO||''))?String(env.SPACES_EMAIL_REPLY_TO):'support@yourspaces.net';
+    let succeeded=0,failed=0;
+    for(const user of recipients) {
+      const deliveryId=crypto.randomUUID();
+      // Claim each recipient before contacting the provider. Failed or interrupted sends are not silently retried.
+      const inserted=await env.DB.prepare("INSERT OR IGNORE INTO platform_email_deliveries_v84(id,campaign_id,actor_user_id,recipient_user_id,recipient_email,sender_address,subject,status,send_id,created_at) VALUES (?,?,?,?,?,?,?,'sending',?,?)").bind(deliveryId,campaignId,auth.user.id,user.id,user.email,sender.email,payload.subject,sendId,Date.now()).run();
+      if(Number(inserted?.meta?.changes||0)!==1)continue;
+      try {
+        const unsubToken=await spacesV84GetOrCreateUnsub(env,user.id);
+        const unsubUrl='https://spaces.spagotei.workers.dev/v1/email/unsubscribe/'+unsubToken;
+        const html=spacesV84Html(payload.heading,payload.subject,payload.body,bannerUrl,replyTo)
+          .replace('</body>',`<div style="text-align:center;padding:12px;font:11px Arial;color:#777">Nonessential staff notices: <a href="${spacesV84Escape(unsubUrl)}">unsubscribe</a></div></body>`);
+        const plain=`${payload.heading||payload.subject}\n\n${payload.body}\n\nSpaces — ${replyTo}\nUnsubscribe from nonessential notices: ${unsubUrl}`;
+        const result=await env.EMAIL.send({to:user.email,from:sender,replyTo,subject:payload.subject,text:plain,html});
+        await env.DB.prepare("UPDATE platform_email_deliveries_v84 SET status='sent',provider_message_id=?,completed_at=? WHERE id=?").bind(String(result?.messageId||''),Date.now(),deliveryId).run();
+        succeeded++;
+      } catch(e) {
+        console.error('Spaces mail delivery failed:',e?.code||'SEND_FAILED');
+        await env.DB.prepare("UPDATE platform_email_deliveries_v84 SET status='failed',error_code=?,completed_at=? WHERE id=?").bind(spacesV84Plain(e?.code||'EMAIL_PROVIDER_ERROR',80),Date.now(),deliveryId).run();
+        failed++;
+      }
+    }
+    return json({campaignId,sent:succeeded,failed,total:recipients.length,excluded:resolved.optedOut},failed?207:201);
+  } catch(e){return spacesV84Error(e?.message||'Email campaign failed.',400);}
+}
+
+
+// SPACES_V84_2_STAFF_CENTER_API
+// Read-only support overview: Staff/Founder only, authenticated on EVERY request.
+// Account email addresses are sensitive; server side authorization is mandatory.
+async function spacesV842CenterAccess(request, env) {
+  // Reuse V84 role+capability check; browser Developer Mode only controls visibility.
+  const auth = await spacesV84Access(request, env);
+  if ('response' in auth) return auth;
+  await enforceRateLimit(request, env, 'staff-center-read-v842', 60, 3600000, auth.user.id);
+  return auth;
+}
+async function spacesV842CenterAudit(env, actor, operation, count) {
+  // Audit data access without storing searched names or email addresses.
+  await env.DB.prepare('INSERT INTO platform_staff_access_audit_v84_2 (id,actor_user_id,action,row_count,created_at) VALUES (?,?,?,?,?)')
+    .bind(crypto.randomUUID(),actor,operation,count,Date.now()).run();
+}
+async function spacesV842CenterAccounts(request, env) {
+  const auth = await spacesV842CenterAccess(request,env);
+  if ('response' in auth) return auth.response;
+  const query = String(new URL(request.url).searchParams.get('q')||'').trim().slice(0,80);
+  if (query.length < 2) return json({accounts:[],hint:'Search at least two characters to look up a member.'});
+  // Literal search: escape SQL LIKE wildcard operators; bound value prevents injection.
+  const q = '%'+query.replace(/[\\%_]/g,'\\$&')+'%';
+  const {results=[]} = await env.DB.prepare("SELECT id,public_user_id,username,display_name,email,email_verified,platform_role FROM users WHERE username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\' OR email LIKE ? ESCAPE '\\' OR public_user_id LIKE ? ESCAPE '\\' ORDER BY username LIMIT 30")
+    .bind(q,q,q,q).all();
+  await spacesV842CenterAudit(env,auth.user.id,'member_email_lookup',results.length);
+  return json({accounts:results.map(u=>({id:u.id,publicUserId:u.public_user_id,username:u.username,displayName:u.display_name,email:u.email,verified:Boolean(u.email_verified),platformRole:u.platform_role==='creator'?'founder':u.platform_role||null}))});
+}
+async function spacesV842CenterSent(request,env) {
+  const auth=await spacesV842CenterAccess(request,env);
+  if('response' in auth)return auth.response;
+  const {results=[]}=await env.DB.prepare('SELECT d.id,d.sender_address,d.recipient_email,d.subject,d.status,d.created_at,d.completed_at,d.campaign_id,coalesce(u.username,\'\') AS recipient_username,coalesce(a.username,\'\') AS staff_username FROM platform_email_deliveries_v84 d LEFT JOIN users u ON u.id=d.recipient_user_id LEFT JOIN users a ON a.id=d.actor_user_id ORDER BY d.created_at DESC LIMIT 100').all();
+  await spacesV842CenterAudit(env,auth.user.id,'outbound_delivery_history',results.length);
+  return json({deliveries:results.map(r=>({id:r.id,from:r.sender_address,to:r.recipient_email,subject:r.subject,status:r.status,createdAt:Number(r.created_at),completedAt:r.completed_at?Number(r.completed_at):null,campaignId:r.campaign_id,recipientUsername:r.recipient_username,staffUsername:r.staff_username})),inboundConfigured:false});
+}
+
+
+const staffCenterV843 = createStaffCenter({authorize:spacesV84Access,json,rateLimit:enforceRateLimit});
+
+// SPACES_V913_EXTERNAL_EMAIL: one-to-one, authenticated, rate-limited, audited external mail.
+// No raw HTML, arbitrary From headers, bulk lists, or recipient emails from ticket identifiers.
+function spacesV913EmailTarget(value) {
+  const email = String(value ?? '').trim().toLowerCase();
+  if (email.length > 254 || /[,;\s<>\r\n]/u.test(email) || !validEmail(email)) throw Error('Enter one valid email address. Lists and headers are not allowed.');
+  return email;
+}
+async function spacesV913ExternalCheck(request, env) {
+  const auth=await spacesV84Access(request,env);if('response' in auth)return auth.response;
+  try {
+    const data=await readJson(request);
+    spacesV84Sender(env,String(data?.sender||'support'),auth.user);
+    return json({email:spacesV913EmailTarget(data?.recipientEmail)});
+  } catch(error) {return spacesV84Error(error.message||'Invalid destination.',400)}
+}
+async function spacesV913ResolveTicket(request,env) {
+  const auth=await spacesV84Access(request,env);if('response' in auth)return auth.response;
+  try {
+    await enforceRateLimit(request,env,'staff-email-ticket-lookup-v913',30,60*60*1000,auth.user.id);
+    const data=await readJson(request);const ticketId=String(data?.ticketId||'').trim();
+    if(ticketId.length<2||ticketId.length>90)throw Error('Enter a valid ticket or case ID.');
+    const row=await env.DB.prepare('SELECT c.reporter_id AS user_id, u.email_verified, u.email FROM support_cases_v77 c JOIN users u ON u.id=c.reporter_id WHERE c.id=? OR c.case_number=? LIMIT 1').bind(ticketId,ticketId).first();
+    if(!row||!Number(row.email_verified)||!validEmail(row.email))return spacesV84Error('No verified account email is available for that ticket.',404);
+    return json({userId:row.user_id});
+  }catch(error){return spacesV84Error(error.message||'Could not resolve ticket.',400)}
+}
+async function spacesV913ExternalSend(request,env) {
+  const auth=await spacesV924EmailAccess(request,env,'send');if('response' in auth)return auth.response;
+  if(!env.EMAIL||typeof env.EMAIL.send!=='function')return spacesV84Error('Spaces email sending is not configured.',503);
+  try {
+    await enforceRateLimit(request,env,'staff-one-recipient-external-v913',auth.founder?20:3,60*60*1000,auth.user.id);
+    const data=await readJson(request);
+    const payload=spacesV84Payload(data);
+    const sender=spacesV84Sender(env,payload.sender,auth.user);
+    const email=spacesV913EmailTarget(data?.recipientEmail);
+    if(email!==spacesV913EmailTarget(data?.confirmedEmail))throw Error('Recipient changed after review. Review again.');
+    const sendId=String(data?.sendId||'');
+    if(!/^[0-9a-f-]{36}$/i.test(sendId))throw Error('Invalid send ID.');
+    if(payload.body.length<3)throw Error('Write a message first.');
+    const bannerUrl=await spacesV84EnsureBanner(env,payload.bannerId);
+    const recordId=crypto.randomUUID(),now=Date.now();
+    const claimed=await env.DB.prepare("INSERT OR IGNORE INTO platform_email_external_v913 (id,actor_user_id,recipient_email,sender_address,subject,status,send_id,created_at) VALUES (?,?,?,?,?,'sending',?,?)").bind(recordId,auth.user.id,email,sender.email,payload.subject,sendId,now).run();
+    if(Number(claimed?.meta?.changes||0)!==1)return spacesV84Error('This send has already been submitted. Check sent history.',409);
+    const configuredReply=String(env.SPACES_EMAIL_REPLY_TO||'');
+    const replyTo=validEmail(configuredReply)?configuredReply:'support@yourspaces.net';
+    const plain=`${payload.heading||payload.subject}\n\n${payload.body}\n\nSpaces — ${replyTo}`;
+    try {
+      const result=await env.EMAIL.send({to:email,from:sender,replyTo,subject:payload.subject,text:plain,html:spacesV84Html(payload.heading,payload.subject,payload.body,bannerUrl,replyTo)});
+      await env.DB.prepare("UPDATE platform_email_external_v913 SET status='sent',provider_message_id=?,completed_at=? WHERE id=?").bind(String(result?.messageId||''),Date.now(),recordId).run();
+      return json({sent:1,failed:0,deliveryId:recordId},201);
+    } catch(error) {
+      console.error('Spaces external mail provider rejected a send:',error?.code||'EMAIL_PROVIDER_ERROR');
+      await env.DB.prepare("UPDATE platform_email_external_v913 SET status='failed',error_code=?,completed_at=? WHERE id=?").bind(spacesV84Plain(error?.code||'EMAIL_PROVIDER_ERROR',80),Date.now(),recordId).run();
+      return spacesV84Error('Provider did not accept email. Check sender verification and sent history.',502);
+    }
+  }catch(error){return spacesV84Error(error?.message||'External email failed.',400)}
+}
+async function spacesV913History(request,env) {
+  const auth=await spacesV84Access(request,env);if('response' in auth)return auth.response;
+  const rows=await env.DB.prepare('SELECT id,recipient_email,sender_address,subject,status,created_at FROM platform_email_external_v913 WHERE actor_user_id=? ORDER BY created_at DESC LIMIT 100').bind(auth.user.id).all();
+  return json({deliveries:(rows.results||[]).map(row=>({id:row.id,recipientEmail:row.recipient_email,sender:row.sender_address,subject:row.subject,status:row.status,createdAt:Number(row.created_at)}))});
+}
+
+
+// SPACES_V924_EMAIL_GOVERNANCE — separate Founder-configurable email permissions.
+// No client-provided recipient lists or From addresses are trusted in global sends.
+const spacesV924IsFounder = user => user?.platform_role === 'creator';
+const spacesV924SafeText = (v,n=500) => String(v??'').trim().slice(0,n);
+const spacesV924True = v => Number(v) === 1;
+async function spacesV924EmailAccess(request,env,action='view') {
+  const auth=await requireSupportConsole(request,env);
+  if('response' in auth)return auth;
+  if(!['creator','staff'].includes(auth.user.platform_role))return {response:spacesV84Error('Platform Staff access required.',403)};
+  const founder=spacesV924IsFounder(auth.user);
+  const row=founder?null:await env.DB.prepare('SELECT can_view,can_compose,can_send,can_global_updates FROM platform_email_grants_v924 WHERE user_id=?').bind(auth.user.id).first();
+  const canView=founder||spacesV924True(row?.can_view);
+  const canCompose=founder||(canView&&spacesV924True(row?.can_compose));
+  const canSend=founder||(canCompose&&spacesV924True(row?.can_send));
+  const canGlobalUpdates=founder||(canSend&&spacesV924True(row?.can_global_updates));
+  const allowed={view:canView,compose:canCompose,send:canSend,global_updates:canGlobalUpdates,global_critical:founder,manage:founder};
+  if(!allowed[action])return {response:spacesV84Error('Email permission required: '+action+'.',403)};
+  return {...auth,founder,allowed};
+}
+async function spacesV924Capabilities(request,env) {
+  const auth=await spacesV924EmailAccess(request,env,'view');if('response' in auth)return auth.response;
+  return json({founder:auth.founder,canView:true,canCompose:auth.allowed.compose,canSend:auth.allowed.send,canGlobalUpdates:auth.allowed.global_updates,canGlobalCritical:auth.allowed.global_critical,canManage:auth.allowed.manage,externalBatchLimit:auth.founder?20:3});
+}
+async function spacesV924Audit(env,actor,action,target=null,campaign=null,detail='') {
+  await env.DB.prepare('INSERT INTO platform_email_actions_v924(id,actor_user_id,action,target_user_id,campaign_id,detail,created_at) VALUES(?,?,?,?,?,?,?)').bind(crypto.randomUUID(),actor,action,target,campaign,spacesV924SafeText(detail,240),Date.now()).run();
+}
+async function spacesV924ListGrants(request,env) {
+  const auth=await spacesV924EmailAccess(request,env,'manage');if('response' in auth)return auth.response;
+  const rows=await env.DB.prepare("SELECT g.user_id,u.display_name,u.platform_role,g.can_view,g.can_compose,g.can_send,g.can_global_updates FROM platform_email_grants_v924 g JOIN users u ON u.id=g.user_id WHERE u.platform_role='staff' ORDER BY u.display_name LIMIT 300").all();
+  return json({grants:rows.results||[]});
+}
+async function spacesV924SaveGrant(request,env) {
+  const auth=await spacesV924EmailAccess(request,env,'manage');if('response' in auth)return auth.response;
+  try {
+    await enforceRateLimit(request,env,'v924-founder-permissions',30,60*60*1000,auth.user.id);
+    const raw=await readJson(request);const userId=spacesV924SafeText(raw.userId,80);
+    const user=await env.DB.prepare('SELECT id,platform_role,display_name FROM users WHERE id=? LIMIT 1').bind(userId).first();
+    if(!user||user.platform_role!=='staff')return spacesV84Error('Choose an existing platform Staff account.',400);
+    const view=raw.view===true?1:0,compose=view&&raw.compose===true?1:0,send=compose&&raw.send===true?1:0,globalUpdates=send&&raw.globalUpdates===true?1:0;
+    await env.DB.prepare('INSERT INTO platform_email_grants_v924(user_id,can_view,can_compose,can_send,can_global_updates,updated_by,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET can_view=excluded.can_view,can_compose=excluded.can_compose,can_send=excluded.can_send,can_global_updates=excluded.can_global_updates,updated_by=excluded.updated_by,updated_at=excluded.updated_at').bind(user.id,view,compose,send,globalUpdates,auth.user.id,Date.now()).run();
+    await spacesV924Audit(env,auth.user.id,'email.permission.update',user.id,null,JSON.stringify({view,compose,send,globalUpdates}));
+    return json({ok:true,userId:user.id,displayName:user.display_name});
+  }catch(e){return spacesV84Error(e.message||'Could not change permissions.',400)}
+}
+// Personal email settings are available to any authenticated Spaces account, not just Staff.
+async function spacesV924MyPreferences(request,env) {
+  const auth=await requireUser(request,env);if('response' in auth)return auth.response;
+  if(request.method==='GET') {
+    const row=await env.DB.prepare('SELECT updates_opt_in FROM platform_email_subscriptions_v924 WHERE user_id=?').bind(auth.user.id).first();
+    return json({updates:spacesV924True(row?.updates_opt_in)});
+  }
+  try {
+    const raw=await readJson(request);if(typeof raw?.updates!=='boolean')return spacesV84Error('Choose whether to receive Spaces updates.',400);
+    const now=Date.now(),token=crypto.randomUUID()+crypto.randomUUID().replace(/-/g,'');
+    await env.DB.prepare('INSERT INTO platform_email_subscriptions_v924(user_id,updates_opt_in,unsubscribe_token,updated_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET updates_opt_in=excluded.updates_opt_in,updated_at=excluded.updated_at').bind(auth.user.id,raw.updates?1:0,token,now).run();
+    return json({updates:raw.updates});
+  }catch(e){return spacesV84Error('Could not save email preferences.',400)}
+}
+async function spacesV924Unsubscribe(request,env,token) {
+  if(!/^[a-f0-9-]{68}$/i.test(token))return new Response('Invalid link.',{status:400});
+  const row=await env.DB.prepare('SELECT user_id,updates_opt_in FROM platform_email_subscriptions_v924 WHERE unsubscribe_token=?').bind(token).first();
+  if(!row)return new Response('Link not found.',{status:404});
+  if(request.method==='POST')await env.DB.prepare('UPDATE platform_email_subscriptions_v924 SET updates_opt_in=0,updated_at=? WHERE user_id=?').bind(Date.now(),row.user_id).run();
+  const done=request.method==='POST';
+  return new Response(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Spaces email preferences</title><body style="background:#0c0d13;color:#eee;font:16px system-ui;min-height:80vh;display:grid;place-items:center"><main style="padding:30px;max-width:480px"><h1>Spaces</h1><p>${done?'You are unsubscribed from Spaces Updates.':'Unsubscribe from Spaces Updates? Security and necessary account notices may still be delivered.'}</p>${done?'':'<form method="post"><button style="padding:12px 20px;border-radius:10px">Unsubscribe</button></form>'}</main></body></html>`,{status:200,headers:{'Content-Type':'text/html;charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'}});
+}
+// Counts and snapshots are calculated in D1, never submitted as arbitrary client email lists.
+const spacesV924Where = cat => cat==='updates' ? "u.email_verified=1 AND u.email IS NOT NULL AND COALESCE(s.updates_opt_in,0)=1 AND COALESCE(p.opted_out,0)=0" : "u.email_verified=1 AND u.email IS NOT NULL";
+function spacesV924EligibleSQL(category,countOnly=false) {
+  return `SELECT ${countOnly?'COUNT(DISTINCT LOWER(u.email)) AS n':'u.id,LOWER(u.email) AS email'} FROM users u LEFT JOIN platform_email_subscriptions_v924 s ON s.user_id=u.id LEFT JOIN platform_email_preferences_v84 p ON p.user_id=u.id WHERE ${spacesV924Where(category)}`+(countOnly?'':' ORDER BY u.id');
+}
+async function spacesV924GlobalPreview(request,env) {
+  const auth=await spacesV924EmailAccess(request,env,'global_updates');if('response' in auth)return auth.response;
+  const counts=await Promise.all(['updates','service','critical'].map(async kind=>{
+    if(kind!=='updates'&&!auth.founder)return {category:kind,count:null};
+    const x=await env.DB.prepare(spacesV924EligibleSQL(kind,true)).first();return {category:kind,count:Number(x?.n||0)};
+  }));return json({audiences:counts});
+}
+async function spacesV924CreateCampaign(request,env) {
+  const auth=await spacesV924EmailAccess(request,env,'global_updates');if('response' in auth)return auth.response;
+  if(!env.EMAIL||typeof env.EMAIL.send!=='function')return spacesV84Error('Sending unavailable.',503);
+  try {
+    await enforceRateLimit(request,env,'v924-campaign-create',6,60*60*1000,auth.user.id);
+    const raw=await readJson(request),category=String(raw.category||'');
+    if(!['updates','service','critical'].includes(category))return spacesV84Error('Invalid email category.',400);
+    if(category!=='updates'&&!auth.founder)return spacesV84Error('Only Founder may send global service and critical notices.',403);
+    const payload=spacesV84Payload(raw),reason=spacesV924SafeText(raw.reason,600);
+    if(reason.length<15)return spacesV84Error('Provide a clear reason for this global email.',400);
+    const sender=category==='critical'?'security':'hello';
+    if(payload.sender!==sender)return spacesV84Error('Choose the official sender for this category.',400);
+    spacesV84Sender(env,sender,auth.user);
+    const sendId=spacesV924SafeText(raw.sendId,40);
+    if(!/^[0-9a-f-]{36}$/i.test(sendId))return spacesV84Error('Invalid campaign confirmation ID.',400);
+    const countRow=await env.DB.prepare(spacesV924EligibleSQL(category,true)).first();const count=Number(countRow?.n||0);
+    if(!count)return spacesV84Error('No eligible verified accounts for this category.',409);
+    if(count>20000)return spacesV84Error('Campaign exceeds the 20,000-account safety cap. Contact engineering to raise it.',409);
+    if(Number(raw.confirmedCount)!==count)return spacesV84Error('Audience changed. Review the count again.',409);
+    const id=crypto.randomUUID();
+    const claim=await env.DB.prepare("INSERT OR IGNORE INTO platform_email_campaigns_v924(id,actor_user_id,category,sender_key,subject,heading,body,reason,send_id,status,recipient_count,created_at) VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?)").bind(id,auth.user.id,category,sender,payload.subject,payload.heading,payload.body,reason,sendId,count,Date.now()).run();
+    if(Number(claim.meta?.changes||0)!==1)return spacesV84Error('This campaign was already requested; check status.',409);
+    // Snapshot only account IDs and verified destinations. Duplicate email addresses are ignored.
+    await env.DB.prepare(`INSERT OR IGNORE INTO platform_email_campaign_recipients_v924(campaign_id,user_id,recipient_email,status) SELECT ?, u.id, LOWER(u.email),'queued' FROM users u LEFT JOIN platform_email_subscriptions_v924 s ON s.user_id=u.id LEFT JOIN platform_email_preferences_v84 p ON p.user_id=u.id WHERE ${spacesV924Where(category)} ORDER BY u.id`).bind(id).run();
+    await spacesV924Audit(env,auth.user.id,'email.global.create',null,id,category+' eligible='+count);
+    return json({id,status:'queued',count},201);
+  }catch(e){return spacesV84Error(e.message||'Campaign could not be created.',400)}
+}
+async function spacesV924CampaignStatus(request,env,id) {
+  const auth=await spacesV924EmailAccess(request,env,'global_updates');if('response' in auth)return auth.response;
+  const campaign=await env.DB.prepare('SELECT id,actor_user_id,category,subject,status,recipient_count,created_at FROM platform_email_campaigns_v924 WHERE id=?').bind(id).first();
+  if(!campaign)return spacesV84Error('Campaign not found.',404);
+  if(!auth.founder&&campaign.actor_user_id!==auth.user.id)return spacesV84Error('This campaign belongs to another sender.',403);
+  const result=await env.DB.prepare('SELECT status,COUNT(*) AS n FROM platform_email_campaign_recipients_v924 WHERE campaign_id=? GROUP BY status').bind(id).all();
+  const totals=Object.fromEntries((result.results||[]).map(x=>[x.status,Number(x.n)]));
+  return json({campaign:{id:campaign.id,category:campaign.category,subject:campaign.subject,status:campaign.status,total:campaign.recipient_count,createdAt:campaign.created_at,queued:totals.queued||0,sending:totals.sending||0,sent:totals.sent||0,failed:totals.failed||0,skipped:totals.skipped||0}});
+}
+async function spacesV924ListCampaigns(request,env) {
+  const auth=await spacesV924EmailAccess(request,env,'global_updates');if('response' in auth)return auth.response;
+  const result=auth.founder
+    ? await env.DB.prepare('SELECT id,category,subject,status,recipient_count,created_at FROM platform_email_campaigns_v924 ORDER BY created_at DESC LIMIT 20').all()
+    : await env.DB.prepare('SELECT id,category,subject,status,recipient_count,created_at FROM platform_email_campaigns_v924 WHERE actor_user_id=? ORDER BY created_at DESC LIMIT 20').bind(auth.user.id).all();
+  return json({campaigns:(result.results||[]).map(row=>({id:row.id,category:row.category,subject:row.subject,status:row.status,total:row.recipient_count,createdAt:row.created_at}))});
+}
+async function spacesV924ProcessBatch(request,env,id) {
+  const auth=await spacesV924EmailAccess(request,env,'global_updates');if('response' in auth)return auth.response;
+  try {
+    await enforceRateLimit(request,env,'v924-global-send-batch',20,60*60*1000,auth.user.id);
+    const campaign=await env.DB.prepare('SELECT * FROM platform_email_campaigns_v924 WHERE id=?').bind(id).first();
+    if(!campaign)return spacesV84Error('Campaign not found.',404);
+    if(!auth.founder&&campaign.actor_user_id!==auth.user.id)return spacesV84Error('This campaign belongs to another sender.',403);
+    if(campaign.category!=='updates'&&!auth.founder)return spacesV84Error('Only Founder may process global service and critical campaigns.',403);
+    if(campaign.status==='completed')return await spacesV924CampaignStatus(request,env,id);
+    const ready=await env.DB.prepare("SELECT user_id,recipient_email FROM platform_email_campaign_recipients_v924 WHERE campaign_id=? AND status='queued' ORDER BY user_id LIMIT 5").bind(id).all();
+    const sender=spacesV84Sender(env,campaign.sender_key,auth.user),replyTo=validEmail(String(env.SPACES_EMAIL_REPLY_TO||''))?String(env.SPACES_EMAIL_REPLY_TO):'support@yourspaces.net';
+    for(const row of ready.results||[]) {
+      const claim=await env.DB.prepare("UPDATE platform_email_campaign_recipients_v924 SET status='sending' WHERE campaign_id=? AND user_id=? AND status='queued'").bind(id,row.user_id).run();
+      if(Number(claim.meta?.changes||0)!==1)continue;
+      // Recheck current verification and consent immediately before sending.
+      const stillEligible=await env.DB.prepare(`SELECT u.email FROM users u LEFT JOIN platform_email_subscriptions_v924 s ON s.user_id=u.id LEFT JOIN platform_email_preferences_v84 p ON p.user_id=u.id WHERE u.id=? AND LOWER(u.email)=? AND ${spacesV924Where(campaign.category)}`).bind(row.user_id,row.recipient_email).first();
+      if(!stillEligible||!validEmail(row.recipient_email)) {await env.DB.prepare("UPDATE platform_email_campaign_recipients_v924 SET status='skipped',completed_at=? WHERE campaign_id=? AND user_id=?").bind(Date.now(),id,row.user_id).run();continue;}
+      try {
+        const unsub=campaign.category==='updates' ? await spacesV924EnsureUnsub(env,row.user_id) : null;
+        const footer=unsub?'\n\nUnsubscribe from Spaces Updates: https://spaces.spagotei.workers.dev/v1/email/v924/unsubscribe/'+unsub:'';
+        const html=spacesV84Html(campaign.heading,campaign.subject,campaign.body,'',replyTo).replace('</body>',(unsub?`<div style="text-align:center;padding:16px"><a href="https://spaces.spagotei.workers.dev/v1/email/v924/unsubscribe/${unsub}">Unsubscribe from Updates</a></div>`:'')+'</body>');
+        const result=await env.EMAIL.send({to:row.recipient_email,from:sender,replyTo,subject:campaign.subject,text:(campaign.heading||campaign.subject)+'\n\n'+campaign.body+'\n\nSpaces'+footer,html});
+        await env.DB.prepare("UPDATE platform_email_campaign_recipients_v924 SET status='sent',provider_message_id=?,completed_at=? WHERE campaign_id=? AND user_id=?").bind(String(result?.messageId||''),Date.now(),id,row.user_id).run();
+      }catch(error){console.error('Spaces campaign send error',error?.code||'SEND_FAILED');await env.DB.prepare("UPDATE platform_email_campaign_recipients_v924 SET status='failed',error_code=?,completed_at=? WHERE campaign_id=? AND user_id=?").bind(spacesV84Plain(error?.code||'EMAIL_PROVIDER_ERROR',80),Date.now(),id,row.user_id).run();}
+    }
+    const pending=await env.DB.prepare("SELECT COUNT(*) AS n FROM platform_email_campaign_recipients_v924 WHERE campaign_id=? AND status='queued'").bind(id).first();
+    if(!Number(pending?.n||0))await env.DB.prepare("UPDATE platform_email_campaigns_v924 SET status='completed',completed_at=?,body='' WHERE id=?").bind(Date.now(),id).run();
+    else await env.DB.prepare("UPDATE platform_email_campaigns_v924 SET status='running' WHERE id=?").bind(id).run();
+    return spacesV924CampaignStatus(request,env,id);
+  }catch(e){return spacesV84Error(e.message||'Batch could not be processed.',400)}
+}
+async function spacesV924EnsureUnsub(env,userId) {
+  const current=await env.DB.prepare('SELECT unsubscribe_token FROM platform_email_subscriptions_v924 WHERE user_id=?').bind(userId).first();
+  if(current?.unsubscribe_token)return current.unsubscribe_token;
+  const token=crypto.randomUUID()+crypto.randomUUID().replace(/-/g,'');
+  await env.DB.prepare('INSERT OR IGNORE INTO platform_email_subscriptions_v924(user_id,updates_opt_in,unsubscribe_token,updated_at) VALUES(?,?,?,?)').bind(userId,0,token,Date.now()).run();
+  const stored=await env.DB.prepare('SELECT unsubscribe_token FROM platform_email_subscriptions_v924 WHERE user_id=?').bind(userId).first();
+  return stored?.unsubscribe_token||token;
+}
+
+
 export default {
+    async email(message, env) { return receiveStaffEmail(message, env); },
     async fetch(request, env) {
         if (!requestOriginAllowed(request, env)) {
             return forbiddenOriginResponse();
@@ -10951,6 +13719,32 @@ export default {
         }
         const url = new URL(request.url);
         try {
+            // V90 authenticated recognition workflow (no public application endpoint).
+            if (url.pathname.includes('/program-applications') || url.pathname.includes('/program-badges')) {
+              const replyV90 = await handleSpacesProgramsV90(request,env,url,{requireWorkspaceMembership,requireSupportConsole,supportPermissionsForUserV48,fail,json,readJson,enforceRateLimit});
+              if (replyV90) return replyV90;
+            }
+            // SPACES_V81_2_ROUTES_START
+            if (url.pathname === '/v1/voice/v85/events' && request.method === 'GET') return await getDmCallEventsV85(request,env,{requireUser,directConversationForUser,json,fail});
+            if (url.pathname === '/v1/voice/v81/ice' && request.method === 'GET') return await spacesV812VoiceIce(request,env);
+            if (url.pathname === '/v1/voice/v81/inbox' && request.method === 'GET') return await spacesV812VoiceInbox(request,env);
+            if (url.pathname === '/v1/voice/v81/calls' && request.method === 'POST') return await spacesV812VoiceCreate(request,env);
+            const spacesV812SignalRoute = url.pathname.match(/^\/v1\/voice\/v81\/calls\/([^/]+)\/signals$/u);
+            if (spacesV812SignalRoute && ['GET','POST'].includes(request.method)) return await spacesV812VoiceCall(request,env,decodeURIComponent(spacesV812SignalRoute[1]),request.method==='GET'?'read':'send');
+            // SPACES_V81_2_ROUTES_END
+            // SPACES_V80_3_ROUTES_START
+            if (url.pathname === '/v1/spaces/trust' && request.method === 'GET') return await spacesV803PartnerPublic(request,env);
+            const spacesV803TrustRoute = url.pathname.match(/^\/v1\/spaces\/([^/]+)\/trust$/u);
+            if (spacesV803TrustRoute && request.method === 'GET') return await spacesV803PartnerPublic(request,env,decodeURIComponent(spacesV803TrustRoute[1]));
+            if (url.pathname === '/v1/partners/applications' && ['GET','POST'].includes(request.method)) return await spacesV803PartnerApplications(request,env);
+            if (url.pathname === '/v1/support/partners' && ['GET','POST'].includes(request.method)) return await spacesV803PartnerStaff(request,env);
+            if (url.pathname === '/v1/support/email/capabilities' && request.method === 'GET') return await spacesV803EmailCapabilities(request,env);
+            if (url.pathname === '/v1/support/email' && request.method === 'POST') return await spacesV803EmailSend(request,env);
+            if (url.pathname === '/v1/support/v80/my-archives' && request.method === 'GET') return await spacesV803MemberArchives(request,env);
+            if (url.pathname === '/v1/support/v80/archive-health' && request.method === 'GET') return await spacesV803ArchiveHealth(request,env);
+            const spacesV803ArchiveRoute = url.pathname.match(/^\/v1\/support\/v80\/cases\/([^/]+)\/archive$/u);
+            if (spacesV803ArchiveRoute && request.method === 'PATCH') return await spacesV803MemberArchives(request,env,decodeURIComponent(spacesV803ArchiveRoute[1]));
+            // SPACES_V80_3_ROUTES_END
             if (request.method === 'GET' &&
                 (url.pathname === '/' ||
                     url.pathname === '/health')) {
@@ -10958,6 +13752,55 @@ export default {
             }
 
 
+            // SPACES_V83_BROADCAST_ROUTES: unchanged legacy API routes below.
+            if (url.pathname === '/v1/broadcasts/active' && request.method === 'GET') return broadcastV83ListActive(request, env);
+            const broadcastDismissV83 = url.pathname.match(/^\/v1\/broadcasts\/([^/]+)\/dismiss$/u);
+            if (broadcastDismissV83 && request.method === 'POST') return broadcastV83Dismiss(request,env,broadcastDismissV83[1]);
+            if (url.pathname === '/v1/staff/broadcasts' && request.method === 'GET') return broadcastV83ListStaff(request,env);
+            if (url.pathname === '/v1/staff/broadcasts' && request.method === 'POST') return broadcastV83Publish(request,env);
+            if (url.pathname === '/v1/staff/broadcasts/image' && request.method === 'POST') return broadcastV83UploadImage(request,env);
+            const broadcastUnpublishV83 = url.pathname.match(/^\/v1\/staff\/broadcasts\/([^/]+)\/unpublish$/u);
+            if (broadcastUnpublishV83 && request.method === 'POST') return broadcastV83Unpublish(request,env,broadcastUnpublishV83[1]);
+            const broadcastImageV83 = url.pathname.match(/^\/v1\/broadcast-images\/([^/]+)$/u);
+            if (broadcastImageV83 && (request.method === 'GET' || request.method === 'HEAD')) return broadcastV83GetImage(env,broadcastImageV83[1],request.method);
+
+            // SPACES_V84_EMAIL_ROUTES
+            if (url.pathname === '/v1/staff/email/capabilities' && request.method === 'GET') return spacesV84Capabilities(request,env);
+            if (url.pathname === '/v1/staff/email/preview' && request.method === 'POST') return spacesV84Preview(request,env);
+            if (url.pathname === '/v1/staff/email/audience-preview' && request.method === 'POST') return spacesV84AudiencePreview(request,env);
+            if (url.pathname === '/v1/staff/email/v913/external-check' && request.method === 'POST') return spacesV913ExternalCheck(request,env);
+if (url.pathname === '/v1/staff/email/v913/external-send' && request.method === 'POST') return spacesV913ExternalSend(request,env);
+if (url.pathname === '/v1/staff/email/v913/resolve-ticket' && request.method === 'POST') return spacesV913ResolveTicket(request,env);
+if (url.pathname === '/v1/staff/email/v913/history' && request.method === 'GET') return spacesV913History(request,env);
+if (url.pathname === '/v1/staff/email/v924/capabilities' && request.method === 'GET') return spacesV924Capabilities(request,env);
+            if (url.pathname === '/v1/staff/email/v924/grants' && request.method === 'GET') return spacesV924ListGrants(request,env);
+            if (url.pathname === '/v1/staff/email/v924/grants' && request.method === 'PUT') return spacesV924SaveGrant(request,env);
+            if (url.pathname === '/v1/email/v924/preferences' && ['GET','PATCH'].includes(request.method)) return spacesV924MyPreferences(request,env);
+            const spacesV924UnsubMatch=url.pathname.match(/^\/v1\/email\/v924\/unsubscribe\/([^/]+)$/u);
+            if (spacesV924UnsubMatch && ['GET','POST'].includes(request.method)) return spacesV924Unsubscribe(request,env,spacesV924UnsubMatch[1]);
+            if (url.pathname === '/v1/staff/email/v924/global-preview' && request.method === 'GET') return spacesV924GlobalPreview(request,env);
+            if (url.pathname === '/v1/staff/email/v924/campaigns' && request.method === 'POST') return spacesV924CreateCampaign(request,env);
+            if (url.pathname === '/v1/staff/email/v924/campaigns' && request.method === 'GET') return spacesV924ListCampaigns(request,env);
+            const spacesV924CampaignMatch=url.pathname.match(/^\/v1\/staff\/email\/v924\/campaigns\/([a-f0-9-]{36})(\/process)?$/iu);
+            if (spacesV924CampaignMatch && request.method === 'GET' && !spacesV924CampaignMatch[2]) return spacesV924CampaignStatus(request,env,spacesV924CampaignMatch[1]);
+            if (spacesV924CampaignMatch && request.method === 'POST' && spacesV924CampaignMatch[2]) return spacesV924ProcessBatch(request,env,spacesV924CampaignMatch[1]);
+            if (url.pathname === '/v1/staff/email/send' && request.method === 'POST') return spacesV84Send(request,env);
+            if (url.pathname === '/v1/staff/email/history' && request.method === 'GET') return spacesV84History(request,env);
+            if (url.pathname === '/v1/staff/email/banners' && request.method === 'GET') return spacesV84ListBanners(request,env);
+            if (url.pathname === '/v1/staff/email/banners' && request.method === 'POST') return spacesV84UploadBanner(request,env);
+            const spacesV84PublicImage = url.pathname.match(/^\/v1\/mail-images\/([^/]+)$/u);
+            if(spacesV84PublicImage && ['GET','HEAD'].includes(request.method)) return spacesV84GetBanner(env,spacesV84PublicImage[1],request.method);
+            const spacesV84Optout = url.pathname.match(/^\/v1\/email\/unsubscribe\/([^/]+)$/u);
+            if(spacesV84Optout && ['GET','POST'].includes(request.method)) return spacesV84Unsubscribe(request,env,spacesV84Optout[1]);
+            // SPACES_V84_3_INBOX_ROUTES: the new gate owns every Center request, including legacy paths.
+            if (url.pathname.startsWith('/v1/staff/center/')) {
+              const response = await staffCenterV843(request,env);
+              if (response.status === 401 || response.status === 403) await recordStaffDeniedV85(env,request,response.status);
+              return response;
+            }
+            // SPACES_V84_2_STAFF_CENTER_ROUTES
+            if (url.pathname === '/v1/staff/center/sent' && request.method === 'GET') return spacesV842CenterSent(request,env);
+            if (url.pathname === '/v1/staff/center/accounts' && request.method === 'GET') return spacesV842CenterAccounts(request,env);
             const desktopUpdateRoute =
                 url.pathname.match(
                     /^\/v1\/desktop\/update\/([^/]+)\/([^/]+)\/([^/]+)$/u,
@@ -11131,6 +13974,15 @@ export default {
                 return unblockAccountUser(request, env, decodeURIComponent(accountBlockRoute[1] ?? ''));
             }
 
+            const directGroupInviteRouteV67 = url.pathname.match(/^\/v1\/direct\/groups\/([^/]+)\/members$/u);
+            if (request.method === 'POST' && directGroupInviteRouteV67) {
+                return addDirectGroupMemberV67(
+                    request,
+                    env,
+                    decodeURIComponent(directGroupInviteRouteV67[1] ?? ''),
+                );
+            }
+
             if (request.method === 'GET' && url.pathname === '/v1/direct/center') {
                 return getDirectCenter(request, env);
             }
@@ -11216,6 +14068,19 @@ export default {
                 return setPlatformSupportRole(request, env, decodeURIComponent(platformRoleRoute[1] ?? ''));
             }
 
+            if (request.method === 'PUT' &&
+                url.pathname === '/v1/notifications/read') {
+                return markNotificationReadV72(request, env);
+            }
+            const typingRouteV72 = url.pathname.match(/^\/v1\/typing\/(channel|dm|group|support)\/([^/]+)$/u);
+            if (typingRouteV72 && ['GET', 'PUT', 'DELETE'].includes(request.method)) {
+                return typingPresenceV72(
+                    request,
+                    env,
+                    decodeURIComponent(typingRouteV72[1] ?? ''),
+                    decodeURIComponent(typingRouteV72[2] ?? ''),
+                );
+            }
             if (request.method === 'GET' &&
                 url.pathname === '/v1/notifications') {
                 return listNotifications(request, env);
@@ -11535,6 +14400,11 @@ export default {
                 );
             }
 
+            // SPACES_V89_NOTE_FOLDERS_ROUTES: auth and permissions on every request.
+            const noteFolderRouteV89=url.pathname.match(/^\/v1\/workspaces\/([^/]+)\/notes-folders(?:\/([^/]+))?$/u);
+            if(noteFolderRouteV89 && ['GET','POST','PUT','PATCH','DELETE'].includes(request.method)){
+              return routeNotesFoldersV89(request,env,decodeURIComponent(noteFolderRouteV89[1]??''),decodeURIComponent(noteFolderRouteV89[2]??''),{requireWorkspaceMembership,fail,json,readJson,channelPermissionRows,channelPermissionAllowed,roleMeetsPermission,normalizeChannelPermission,accessHas,enforceRateLimit});
+            }
             const noteCreateRoute =
                 url.pathname.match(
                     /^\/v1\/workspaces\/([^/]+)\/notes$/u,
@@ -11921,6 +14791,32 @@ export default {
                 );
             }
 
+            // Spaces V77 Support Operations routes
+            if (url.pathname === '/v1/support/v77/my-cases' && request.method === 'GET') return listMySupportCasesV77(request, env);
+            if (url.pathname === '/v1/support/v77/cases') {
+                if (request.method === 'GET') return listSupportCasesV77(request, env);
+                if (request.method === 'POST') return createSupportCaseV77(request, env);
+            }
+            const supportV77CaseEventsRoute = url.pathname.match(/^\/v1\/support\/v77\/cases\/([^/]+)\/events$/u);
+            if (supportV77CaseEventsRoute && request.method === 'POST') return addSupportCaseEventV77(request, env, decodeURIComponent(supportV77CaseEventsRoute[1] ?? ''));
+            const supportV77CaseRoute = url.pathname.match(/^\/v1\/support\/v77\/cases\/([^/]+)$/u);
+            if (supportV77CaseRoute) {
+                const caseIdV77 = decodeURIComponent(supportV77CaseRoute[1] ?? '');
+                if (request.method === 'GET') return getSupportCaseV77(request, env, caseIdV77);
+                if (request.method === 'PATCH') return updateSupportCaseV77(request, env, caseIdV77);
+                if (request.method === 'DELETE') return deleteSupportCaseV77(request, env, caseIdV77);
+            }
+            const supportV77ProfileRoute = url.pathname.match(/^\/v1\/support\/v77\/profiles\/([^/]+)$/u);
+            if (supportV77ProfileRoute && request.method === 'GET') return supportProfileV77(request, env, decodeURIComponent(supportV77ProfileRoute[1] ?? ''));
+            if (url.pathname === '/v1/support/v77/notices' && request.method === 'POST') return sendSupportNoticeV77(request, env);
+            if (url.pathname === '/v1/support/v77/restrictions') {
+                if (request.method === 'GET') return listSupportRestrictionsV77(request, env);
+                if (request.method === 'POST') return createSupportRestrictionV77(request, env);
+            }
+            const supportV77RestrictionRoute = url.pathname.match(/^\/v1\/support\/v77\/restrictions\/([^/]+)$/u);
+            if (supportV77RestrictionRoute && request.method === 'DELETE') return revokeSupportRestrictionV77(request, env, decodeURIComponent(supportV77RestrictionRoute[1] ?? ''));
+            if (url.pathname === '/v1/support/v77/audit' && request.method === 'GET') return listSupportAuditV77(request, env);
+
             if (url.pathname === '/v1/support/me' && request.method === 'GET') {
                 return supportMeV48(request, env);
             }
@@ -11995,6 +14891,62 @@ export default {
                     env,
                     decodeURIComponent(betaAccessRoute[1] ?? ''),
                 );
+            }
+
+
+            if (url.pathname === '/v1/support/tickets') {
+                if (request.method === 'GET') return listSupportTicketsV73(request, env);
+                if (request.method === 'POST') return createSupportTicketV73(request, env);
+            }
+
+            const supportTicketCollaboratorMemberRouteV73 =
+                url.pathname.match(/^\/v1\/support\/tickets\/([^/]+)\/collaborators\/([^/]+)$/u);
+            if (request.method === 'DELETE' && supportTicketCollaboratorMemberRouteV73) {
+                return removeSupportTicketCollaboratorV73(
+                    request,
+                    env,
+                    decodeURIComponent(supportTicketCollaboratorMemberRouteV73[1] ?? ''),
+                    decodeURIComponent(supportTicketCollaboratorMemberRouteV73[2] ?? ''),
+                );
+            }
+
+            const supportTicketCollaboratorsRouteV73 =
+                url.pathname.match(/^\/v1\/support\/tickets\/([^/]+)\/collaborators$/u);
+            if (request.method === 'POST' && supportTicketCollaboratorsRouteV73) {
+                return addSupportTicketCollaboratorV73(
+                    request,
+                    env,
+                    decodeURIComponent(supportTicketCollaboratorsRouteV73[1] ?? ''),
+                );
+            }
+
+            const supportTicketMessagesRouteV73 =
+                url.pathname.match(/^\/v1\/support\/tickets\/([^/]+)\/messages$/u);
+            if (request.method === 'POST' && supportTicketMessagesRouteV73) {
+                return sendSupportTicketMessageV73(
+                    request,
+                    env,
+                    decodeURIComponent(supportTicketMessagesRouteV73[1] ?? ''),
+                );
+            }
+
+            const supportTicketReopenRouteV73 =
+                url.pathname.match(/^\/v1\/support\/tickets\/([^/]+)\/reopen$/u);
+            if (request.method === 'POST' && supportTicketReopenRouteV73) {
+                return reopenSupportTicketV73(
+                    request,
+                    env,
+                    decodeURIComponent(supportTicketReopenRouteV73[1] ?? ''),
+                );
+            }
+
+            const supportTicketRouteV73 =
+                url.pathname.match(/^\/v1\/support\/tickets\/([^/]+)$/u);
+            if (supportTicketRouteV73) {
+                const ticketNumber = decodeURIComponent(supportTicketRouteV73[1] ?? '');
+                if (request.method === 'GET') return getSupportTicketV73(request, env, ticketNumber);
+                if (request.method === 'PATCH') return updateSupportTicketV73(request, env, ticketNumber);
+                if (request.method === 'DELETE') return deleteSupportTicketTranscriptV73(request, env, ticketNumber);
             }
 
             if (url.pathname === '/v1/support/inbox' && request.method === 'GET') {

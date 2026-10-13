@@ -10,9 +10,14 @@
     "db:create": "wrangler d1 create spaces",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
-    "check": "node --check src/worker.js"
+    "check": "node --check src/worker.js",
+    "beta:worker": "node --no-warnings scripts/v80_3_worker_test.mjs .",
+    "voice:worker:check": "node --no-warnings scripts/v81_2_worker_test.mjs ."
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "postal-mime": "4.0.5"
   }
 }
